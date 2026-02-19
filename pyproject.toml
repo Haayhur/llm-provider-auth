@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-provider-auth"
+version = "0.2.0"
+description = "Reusable OAuth auth + LangChain chat models for Antigravity, Codex, and Copilot"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["langchain", "oauth", "antigravity", "codex", "copilot", "llm", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "langchain-core>=0.2.0",
+    "github-copilot-sdk",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
+    "python-dateutil>=2.9.0.post0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+ag-auth = "langchain_antigravity.cli:main"
+codex-auth = "langchain_antigravity.codex_cli:main"
+copilot-auth = "langchain_antigravity.copilot_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = [
+    "__init__.py",
+    "auth.py",
+    "chat_model.py",
+    "cli.py",
+    "constants.py",
+    "schema.py",
+    "codex_auth.py",
+    "codex_chat_model.py",
+    "codex_cli.py",
+    "codex_prompts.py",
+    "copilot_auth.py",
+    "copilot_chat_model.py",
+    "copilot_cli.py",
+    "copilot_models.py",
+]
+
+[tool.hatch.build.targets.wheel.sources]
+"" = "langchain_antigravity"
