@@ -87,7 +87,7 @@ class ChatAntigravity(BaseChatModel):
     
     Supports:
     - Gemini 3 models (Flash, Pro Low, Pro High)
-    - Claude models (Sonnet 4.5, Opus 4.5)
+    - Claude models (Sonnet 4.6, Opus 4.6 Thinking)
     - Extended thinking for supported models
     - Tool/function calling
     
@@ -95,7 +95,7 @@ class ChatAntigravity(BaseChatModel):
         ```python
         from langchain_antigravity import ChatAntigravity
         
-        chat = ChatAntigravity(model="antigravity-claude-sonnet-4-5")
+        chat = ChatAntigravity(model="antigravity-claude-sonnet-4-6")
         response = chat.invoke("Hello!")
         ```
     """
@@ -194,9 +194,11 @@ class ChatAntigravity(BaseChatModel):
         if self.max_output_tokens is not None:
             generation_config["maxOutputTokens"] = self.max_output_tokens
         
-        # Add thinking config if applicable
+        # Add thinking config when the resolved API model supports it.
+        # This preserves tier aliases from self.model (e.g. *-thinking-max)
+        # while preventing stale aliases from forcing thinking on non-thinking models.
         thinking_config = get_thinking_config(self.model)
-        if thinking_config:
+        if thinking_config and is_thinking_model(effective_model):
             generation_config["thinkingConfig"] = thinking_config
         
         # Build request
@@ -210,13 +212,13 @@ class ChatAntigravity(BaseChatModel):
 
         if system_instruction:
             # Add Claude tool hardening if tools are present
-            if self._tools and is_claude_model(self.model):
+            if self._tools and is_claude_model(effective_model):
                 system_text = system_instruction["parts"][0].get("text", "")
                 system_instruction = {
                     "parts": [{"text": f"{system_text}\n\n{constants.CLAUDE_TOOL_SYSTEM_INSTRUCTION}"}]
                 }
             request["systemInstruction"] = system_instruction
-        elif self._tools and is_claude_model(self.model):
+        elif self._tools and is_claude_model(effective_model):
             # Add tool hardening as system instruction if no system message
             request["systemInstruction"] = {
                 "parts": [{"text": constants.CLAUDE_TOOL_SYSTEM_INSTRUCTION}]
@@ -225,7 +227,7 @@ class ChatAntigravity(BaseChatModel):
         if self._tools:
             request["tools"] = [{"functionDeclarations": self._tools}]
             # Claude requires VALIDATED mode for tool calling
-            if is_claude_model(self.model):
+            if is_claude_model(effective_model):
                 request["toolConfig"] = {
                     "functionCallingConfig": {
                         "mode": "VALIDATED",
@@ -300,8 +302,9 @@ class ChatAntigravity(BaseChatModel):
             auth = await self._ensure_auth()
             contents, system_instruction = convert_messages(messages)
             body = self._build_request_body(contents, system_instruction)
+            effective_model = str(body.get("model") or self.model)
 
-            header_style = get_header_style(self.model)
+            header_style = get_header_style(effective_model)
             headers = constants.ANTIGRAVITY_HEADERS if header_style == "antigravity" else constants.GEMINI_CLI_HEADERS
             headers = {
                 **headers,
@@ -309,7 +312,7 @@ class ChatAntigravity(BaseChatModel):
                 "Content-Type": "application/json",
             }
 
-            if is_thinking_model(self.model) and is_claude_model(self.model):
+            if is_thinking_model(effective_model) and is_claude_model(effective_model):
                 headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 
             async with httpx.AsyncClient(timeout=120.0) as client:
@@ -435,8 +438,9 @@ class ChatAntigravity(BaseChatModel):
             auth = await self._ensure_auth()
             contents, system_instruction = convert_messages(messages)
             body = self._build_request_body(contents, system_instruction)
+            effective_model = str(body.get("model") or self.model)
 
-            header_style = get_header_style(self.model)
+            header_style = get_header_style(effective_model)
             headers = constants.ANTIGRAVITY_HEADERS if header_style == "antigravity" else constants.GEMINI_CLI_HEADERS
             headers = {
                 **headers,
@@ -445,7 +449,7 @@ class ChatAntigravity(BaseChatModel):
                 "Accept": "text/event-stream",
             }
 
-            if is_thinking_model(self.model) and is_claude_model(self.model):
+            if is_thinking_model(effective_model) and is_claude_model(effective_model):
                 headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 
             async with httpx.AsyncClient(timeout=120.0) as client:

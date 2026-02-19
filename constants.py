@@ -58,9 +58,9 @@ ANTIGRAVITY_DEFAULT_PROJECT_ID = "rising-fact-p41fc"
 ANTIGRAVITY_PROJECT_ID = os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip() or None
 
 ANTIGRAVITY_HEADERS = {
-    "User-Agent": "antigravity/1.11.5 windows/amd64",
+    "User-Agent": "antigravity/1.15.8 windows/amd64",
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-    "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
+    "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}',
 }
 
 GEMINI_CLI_HEADERS = {
@@ -91,13 +91,20 @@ MODEL_MAPPINGS = {
     "antigravity-gemini-3-flash": "gemini-3-flash",
     "antigravity-gemini-3-pro-low": "gemini-3-pro-low",
     "antigravity-gemini-3-pro-high": "gemini-3-pro-high",
-    "antigravity-claude-sonnet-4-5": "claude-sonnet-4-5",
-    "antigravity-claude-sonnet-4-5-thinking-low": "claude-sonnet-4-5-thinking",
-    "antigravity-claude-sonnet-4-5-thinking-medium": "claude-sonnet-4-5-thinking",
-    "antigravity-claude-sonnet-4-5-thinking-high": "claude-sonnet-4-5-thinking",
-    "antigravity-claude-opus-4-5-thinking-low": "claude-opus-4-5-thinking",
-    "antigravity-claude-opus-4-5-thinking-medium": "claude-opus-4-5-thinking",
-    "antigravity-claude-opus-4-5-thinking-high": "claude-opus-4-5-thinking",
+    # Canonical Claude mappings (Antigravity 4.6 lineup)
+    "antigravity-claude-sonnet-4-6": "claude-sonnet-4-6",
+    "antigravity-claude-opus-4-6-thinking-low": "claude-opus-4-6-thinking",
+    "antigravity-claude-opus-4-6-thinking-medium": "claude-opus-4-6-thinking",
+    "antigravity-claude-opus-4-6-thinking-high": "claude-opus-4-6-thinking",
+    "antigravity-claude-opus-4-6-thinking-max": "claude-opus-4-6-thinking",
+    # Backward-compatible aliases for older saved profiles.
+    "antigravity-claude-sonnet-4-5": "claude-sonnet-4-6",
+    "antigravity-claude-sonnet-4-5-thinking-low": "claude-sonnet-4-6",
+    "antigravity-claude-sonnet-4-5-thinking-medium": "claude-sonnet-4-6",
+    "antigravity-claude-sonnet-4-5-thinking-high": "claude-sonnet-4-6",
+    "antigravity-claude-opus-4-5-thinking-low": "claude-opus-4-6-thinking",
+    "antigravity-claude-opus-4-5-thinking-medium": "claude-opus-4-6-thinking",
+    "antigravity-claude-opus-4-5-thinking-high": "claude-opus-4-6-thinking",
     "gemini-2.5-flash": "gemini-2.5-flash-preview-05-20",
     "gemini-2.5-pro": "gemini-2.5-pro-preview-05-06",
     "gemini-3-flash-preview": "gemini-3.0-flash-preview",
@@ -188,6 +195,11 @@ CODEX_MODEL_MAPPINGS = {
     "gpt-5.2-codex-medium": "gpt-5.2-codex",
     "gpt-5.2-codex-high": "gpt-5.2-codex",
     "gpt-5.2-codex-xhigh": "gpt-5.2-codex",
+    "gpt-5.3-codex": "gpt-5.3-codex",
+    "gpt-5.3-codex-low": "gpt-5.3-codex",
+    "gpt-5.3-codex-medium": "gpt-5.3-codex",
+    "gpt-5.3-codex-high": "gpt-5.3-codex",
+    "gpt-5.3-codex-xhigh": "gpt-5.3-codex",
     "gpt-5.1-codex-max": "gpt-5.1-codex-max",
     "gpt-5.1-codex-max-low": "gpt-5.1-codex-max",
     "gpt-5.1-codex-max-medium": "gpt-5.1-codex-max",
@@ -205,11 +217,11 @@ CODEX_MODEL_MAPPINGS = {
     "gpt-5.1-low": "gpt-5.1",
     "gpt-5.1-medium": "gpt-5.1",
     "gpt-5.1-high": "gpt-5.1",
-    "gpt-5-codex": "gpt-5.1-codex",
-    "gpt-5-codex-low": "gpt-5.1-codex",
-    "gpt-5-codex-medium": "gpt-5.1-codex",
-    "gpt-5-codex-high": "gpt-5.1-codex",
-    "gpt-5-codex-mini": "gpt-5.1-codex-mini",
+    "gpt-5-codex": "gpt-5-codex",
+    "gpt-5-codex-low": "gpt-5-codex",
+    "gpt-5-codex-medium": "gpt-5-codex",
+    "gpt-5-codex-high": "gpt-5-codex",
+    "gpt-5-codex-mini": "codex-mini-latest",
     "gpt-5": "gpt-5.1",
     "gpt-5-none": "gpt-5.1",
     "gpt-5-low": "gpt-5.1",
@@ -217,7 +229,7 @@ CODEX_MODEL_MAPPINGS = {
     "gpt-5-high": "gpt-5.1",
     "gpt-5-mini": "gpt-5.1",
     "gpt-5-nano": "gpt-5.1",
-    "codex-mini-latest": "gpt-5.1-codex-mini",
+    "codex-mini-latest": "codex-mini-latest",
 }
 
 # Antigravity model prefixes for identification

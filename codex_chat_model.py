@@ -3,7 +3,7 @@ LangChain ChatModel for OpenAI Codex API.
 
 This module provides a LangChain BaseChatModel that communicates with OpenAI's
 ChatGPT Codex backend via OAuth authentication, allowing access to GPT-5.x
-and Codex models using a ChatGPT Plus/Pro subscription.
+and Codex models using a ChatGPT subscription.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ _AUTH_METRICS: dict[str, int] = {
     "codex_unauthorized_retry_success": 0,
     "codex_unauthorized_retry_fail": 0,
 }
+_CODEX_OAUTH_ALLOWED_NON_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.2"})
 
 
 def _record_auth_metric(metric: str, **context: str | None) -> None:
@@ -94,23 +95,23 @@ class ChatCodex(BaseChatModel):
     LangChain ChatModel for OpenAI Codex API via ChatGPT OAuth.
 
     Supports:
+    - GPT-5.3 Codex (low/medium/high/xhigh)
     - GPT-5.2 models (none/low/medium/high/xhigh)
     - GPT-5.2 Codex (low/medium/high/xhigh)
     - GPT-5.1 Codex Max (low/medium/high/xhigh)
     - GPT-5.1 Codex (low/medium/high)
     - GPT-5.1 Codex Mini (medium/high)
-    - GPT-5.1 (none/low/medium/high)
 
     Example:
         ```python
         from langchain_antigravity import ChatCodex
 
-        chat = ChatCodex(model="gpt-5.2-codex")
+        chat = ChatCodex(model="gpt-5.3-codex")
         response = chat.invoke("Hello!")
         ```
     """
 
-    model: str = Field(default="gpt-5.2-codex")
+    model: str = Field(default="gpt-5.3-codex")
     """Model name to use."""
 
     temperature: float | None = Field(default=None)
@@ -244,18 +245,122 @@ class ChatCodex(BaseChatModel):
             return True
         return False
 
-    def _extract_error_message(self, response: httpx.Response) -> str:
-        error_text = response.text
+    def _subscription_error_message(
+        self,
+        *,
+        error_code: str | None,
+        error_message: str,
+    ) -> str | None:
+        """Return a user-friendly plan/subscription error when applicable."""
+        combined = f"{error_code or ''} {error_message or ''}".lower()
+
+        if "usage_not_included" in combined:
+            return (
+                "To use Codex with your ChatGPT plan, upgrade to Plus: "
+                "https://chatgpt.com/explore/plus."
+            )
+
+        subscription_tokens = (
+            "requires pro",
+            "chatgpt pro",
+            "pro subscription",
+            "plan does not include",
+            "not included in your plan",
+            "subscription required",
+            "upgrade to plus",
+            "upgrade to pro",
+        )
+        if any(token in combined for token in subscription_tokens):
+            return (
+                "To use Codex with your ChatGPT plan, upgrade to Plus: "
+                "https://chatgpt.com/explore/plus."
+            )
+
+        return None
+
+    def _known_error_code_message(self, *, error_code: str | None, message: str) -> str | None:
+        code = (error_code or "").strip().lower()
+        if not code:
+            return None
+        if code == "context_length_exceeded":
+            return "Input exceeds context window of this model."
+        if code == "insufficient_quota":
+            return "Quota exceeded. Check your plan and billing details."
+        if code == "invalid_prompt":
+            cleaned = (message or "").strip()
+            if cleaned.startswith("{") and cleaned.endswith("}"):
+                return "Invalid prompt."
+            return cleaned or "Invalid prompt."
+        return None
+
+    def _normalize_error_text(
+        self,
+        *,
+        model: str,
+        status_code: int | None,
+        error_text: str,
+    ) -> str:
+        """Normalize provider errors into clearer, user-facing messages."""
+        message = error_text
+        error_code: str | None = None
+
         try:
-            error_data = response.json()
-            if "error" in error_data:
-                error_obj = error_data["error"]
+            payload = json.loads(error_text)
+            if isinstance(payload, dict):
+                error_obj = payload.get("error")
                 if isinstance(error_obj, dict):
-                    return str(error_obj.get("message", error_text))
-                return str(error_obj)
-        except (json.JSONDecodeError, KeyError):
+                    code = error_obj.get("code")
+                    if isinstance(code, str) and code.strip():
+                        error_code = code
+                    raw_msg = error_obj.get("message")
+                    if isinstance(raw_msg, str) and raw_msg.strip():
+                        message = raw_msg
+                elif isinstance(error_obj, str) and error_obj.strip():
+                    message = error_obj
+
+                if not error_code:
+                    top_code = payload.get("code")
+                    if isinstance(top_code, str) and top_code.strip():
+                        error_code = top_code
+        except Exception:
             pass
-        return error_text
+
+        known_code_message = self._known_error_code_message(error_code=error_code, message=message)
+        if known_code_message:
+            return known_code_message
+
+        subscription_message = self._subscription_error_message(
+            error_code=error_code,
+            error_message=message,
+        )
+        if subscription_message:
+            return subscription_message
+        return message
+
+    def _is_allowed_codex_oauth_model(self, model: str) -> bool:
+        model_id = (model or "").strip().lower()
+        if not model_id:
+            return False
+        if "codex" in model_id:
+            return True
+        return model_id in _CODEX_OAUTH_ALLOWED_NON_CODEX_MODELS
+
+    def _should_apply_default_reasoning(self, model: str) -> bool:
+        model_id = (model or "").strip().lower()
+        if "gpt-5" not in model_id:
+            return False
+        if "gpt-5-chat" in model_id:
+            return False
+        if "gpt-5-pro" in model_id:
+            return False
+        return True
+
+    def _extract_error_message(self, response: httpx.Response, *, model: str) -> str:
+        return self._normalize_error_text(
+            model=model,
+            status_code=response.status_code,
+            error_text=response.text,
+        )
 
     async def _recover_after_unauthorized(self, auth: CodexAuth) -> bool:
         """Try to recover once when the backend rejects an existing access token."""
@@ -420,6 +525,11 @@ class ChatCodex(BaseChatModel):
     ) -> dict[str, Any]:
         """Build Codex API request body."""
         effective_model = normalize_codex_model(self.model)
+        if not self._is_allowed_codex_oauth_model(effective_model):
+            raise ValueError(
+                f"Model '{effective_model}' is not available in Codex OAuth flow. "
+                "Use a Codex model or 'gpt-5.2'."
+            )
 
         # ChatGPT Codex backend requirements (mirrors Codex CLI behavior):
         # - `instructions` is required
@@ -441,7 +551,9 @@ class ChatCodex(BaseChatModel):
             body["max_output_tokens"] = self.max_tokens
 
         if self.reasoning_effort is not None:
-            body["reasoning"] = {"effort": self.reasoning_effort}
+            body["reasoning"] = {"effort": self.reasoning_effort, "summary": "auto"}
+        elif self._should_apply_default_reasoning(effective_model):
+            body["reasoning"] = {"effort": "medium", "summary": "auto"}
 
         if self._tools:
             body["tools"] = self._tools
@@ -544,7 +656,7 @@ class ChatCodex(BaseChatModel):
                 response = await client.post(url, headers=headers, json=body)
 
                 if not response.is_success:
-                    error_text = self._extract_error_message(response)
+                    error_text = self._extract_error_message(response, model=effective_model)
                     if self._is_cloudflare_challenge(response.status_code, response.text):
                         raise RuntimeError(
                             "Codex request was blocked by Cloudflare on chatgpt.com (JS/cookie challenge). "
@@ -645,16 +757,11 @@ class ChatCodex(BaseChatModel):
                             if auth.account_id:
                                 headers["chatgpt-account-id"] = auth.account_id
                             continue
-                        try:
-                            error_data = json.loads(error_text)
-                            if "error" in error_data:
-                                error_obj = error_data["error"]
-                                if isinstance(error_obj, dict):
-                                    error_text = error_obj.get("message", error_text)
-                                else:
-                                    error_text = str(error_obj)
-                        except (json.JSONDecodeError, KeyError):
-                            pass
+                        error_text = self._normalize_error_text(
+                            model=effective_model,
+                            status_code=response.status_code,
+                            error_text=error_text,
+                        )
                         raise RuntimeError(f"Codex API error: {response.status_code} - {error_text}")
 
                     async for line in response.aiter_lines():

@@ -16,20 +16,25 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_COPILOT_MODELS = [
-    {"id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "description": "Claude Sonnet 4.5 via Copilot"},
     {"id": "claude-haiku-4.5", "name": "Claude Haiku 4.5", "description": "Claude Haiku 4.5 via Copilot"},
+    {"id": "claude-opus-41", "name": "Claude Opus 4.1", "description": "Claude Opus 4.1 via Copilot"},
     {"id": "claude-opus-4.5", "name": "Claude Opus 4.5", "description": "Claude Opus 4.5 via Copilot"},
     {"id": "claude-sonnet-4", "name": "Claude Sonnet 4", "description": "Claude Sonnet 4 via Copilot"},
-    {"id": "gpt-5.2-codex", "name": "GPT-5.2-Codex", "description": "GPT-5.2-Codex via Copilot"},
-    {"id": "gpt-5.1-codex-max", "name": "GPT-5.1-Codex-Max", "description": "GPT-5.1-Codex-Max via Copilot"},
-    {"id": "gpt-5.1-codex", "name": "GPT-5.1-Codex", "description": "GPT-5.1-Codex via Copilot"},
-    {"id": "gpt-5.2", "name": "GPT-5.2", "description": "GPT-5.2 via Copilot"},
-    {"id": "gpt-5.1", "name": "GPT-5.1", "description": "GPT-5.1 via Copilot"},
-    {"id": "gpt-5", "name": "GPT-5", "description": "GPT-5 via Copilot"},
-    {"id": "gpt-5.1-codex-mini", "name": "GPT-5.1-Codex-Mini", "description": "GPT-5.1-Codex-Mini via Copilot"},
-    {"id": "gpt-5-mini", "name": "GPT-5 mini", "description": "GPT-5 mini via Copilot"},
-    {"id": "gpt-4.1", "name": "GPT-4.1", "description": "GPT-4.1 via Copilot"},
+    {"id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "description": "Claude Sonnet 4.5 via Copilot"},
+    {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "description": "Gemini 2.5 Pro via Copilot"},
+    {"id": "gemini-3-flash-preview", "name": "Gemini 3 Flash (Preview)", "description": "Gemini 3 Flash (Preview) via Copilot"},
     {"id": "gemini-3-pro-preview", "name": "Gemini 3 Pro (Preview)", "description": "Gemini 3 Pro (Preview) via Copilot"},
+    {"id": "gpt-4.1", "name": "GPT-4.1", "description": "GPT-4.1 via Copilot"},
+    {"id": "gpt-4o", "name": "GPT-4o", "description": "GPT-4o via Copilot"},
+    {"id": "gpt-5", "name": "GPT-5", "description": "GPT-5 via Copilot"},
+    {"id": "gpt-5-mini", "name": "GPT-5 mini", "description": "GPT-5 mini via Copilot"},
+    {"id": "gpt-5.1", "name": "GPT-5.1", "description": "GPT-5.1 via Copilot"},
+    {"id": "gpt-5.1-codex", "name": "GPT-5.1-Codex", "description": "GPT-5.1-Codex via Copilot"},
+    {"id": "gpt-5.1-codex-max", "name": "GPT-5.1-Codex-Max", "description": "GPT-5.1-Codex-Max via Copilot"},
+    {"id": "gpt-5.1-codex-mini", "name": "GPT-5.1-Codex-Mini", "description": "GPT-5.1-Codex-Mini via Copilot"},
+    {"id": "gpt-5.2", "name": "GPT-5.2", "description": "GPT-5.2 via Copilot"},
+    {"id": "gpt-5.2-codex", "name": "GPT-5.2-Codex", "description": "GPT-5.2-Codex via Copilot"},
+    {"id": "grok-code-fast-1", "name": "Grok Code Fast 1", "description": "Grok Code Fast 1 via Copilot"},
 ]
 
 _MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]+")

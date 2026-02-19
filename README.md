@@ -2,7 +2,20 @@
 
 Reusable OAuth auth + LangChain chat models for **Antigravity (Gemini/Claude)**, **OpenAI Codex (GPT-5.x)**, and **GitHub Copilot**.
 
-This package provides native Python LangChain `ChatModel` implementations with OAuth authentication for both Google's Antigravity API and OpenAI's Codex backend, allowing you to use models like `gemini-3-flash`, `gpt-5.2-codex`, `claude-sonnet-4-5`, and more in your LangChain applications.
+This package provides native Python LangChain `ChatModel` implementations with OAuth authentication for both Google's Antigravity API and OpenAI's Codex backend, allowing you to use models like `gemini-3-flash`, `gpt-5.3-codex`, `claude-sonnet-4-6`, and more in your LangChain applications.
+
+## Terms Warning (Antigravity)
+
+> [!CAUTION]
+> Using the Antigravity provider may violate Google's Terms of Service.
+> Some users have reported account bans or shadow restrictions.
+>
+> Higher-risk cases reported by the reference plugin community:
+> - Fresh Google accounts
+> - New accounts with Pro/Ultra subscriptions
+>
+> By using Antigravity authentication here, you accept that risk.
+> Prefer an established account that is not critical to your day-to-day services.
 
 ## Installation
 
@@ -55,7 +68,7 @@ This opens your browser to sign in with ChatGPT/OpenAI. Credentials are stored l
 ```python
 from langchain_antigravity import ChatCodex
 
-chat = ChatCodex(model="gpt-5.2-codex")
+chat = ChatCodex(model="gpt-5.3-codex")
 response = chat.invoke("Hello! What's 2 + 2?")
 print(response.content)
 ```
@@ -99,31 +112,32 @@ print(response.content)
 
 | Model | Description |
 |-------|-------------|
-| `antigravity-claude-sonnet-4-5` | Claude Sonnet 4.5 |
-| `antigravity-claude-sonnet-4-5-thinking-low` | Sonnet with 8K thinking budget |
-| `antigravity-claude-sonnet-4-5-thinking-medium` | Sonnet with 16K thinking budget |
-| `antigravity-claude-sonnet-4-5-thinking-high` | Sonnet with 32K thinking budget |
-| `antigravity-claude-opus-4-5-thinking-low` | Opus with 8K thinking budget |
-| `antigravity-claude-opus-4-5-thinking-medium` | Opus with 16K thinking budget |
-| `antigravity-claude-opus-4-5-thinking-high` | Opus with 32K thinking budget |
+| `antigravity-claude-sonnet-4-6` | Claude Sonnet 4.6 |
+| `antigravity-claude-opus-4-6-thinking-low` | Opus 4.6 with low thinking budget |
+| `antigravity-claude-opus-4-6-thinking-medium` | Opus 4.6 with medium thinking budget |
+| `antigravity-claude-opus-4-6-thinking-high` | Opus 4.6 with high thinking budget |
+| `antigravity-claude-opus-4-6-thinking-max` | Opus 4.6 with max thinking budget |
+
+Backward-compatible `4.5` aliases are still accepted and mapped to the `4.6` lineup.
 
 ### OpenAI Codex Models (via `codex-auth login`)
 
-#### GPT-5.2 Models
+#### Common models
 
 | Model | Description |
 |-------|-------------|
-| `gpt-5.2` | GPT-5.2 general purpose (none/low/medium/high/xhigh) |
-| `gpt-5.2-codex` | GPT-5.2 Codex with reasoning (low/medium/high/xhigh) |
-
-#### GPT-5.1 Models
-
-| Model | Description |
-|-------|-------------|
-| `gpt-5.1` | GPT-5.1 general purpose (none/low/medium/high) |
+| `gpt-5.3-codex` | Latest GPT-5 Codex model |
+| `gpt-5-codex` | GPT-5 Codex family model |
+| `gpt-5.2` | GPT-5.2 base model |
+| `gpt-5.2-codex` | GPT-5.2 Codex |
+| `gpt-5.1-codex` | GPT-5.1 Codex |
 | `gpt-5.1-codex-max` | GPT-5.1 Codex Max with frontend design focus |
-| `gpt-5.1-codex` | GPT-5.1 Codex (low/medium/high) |
 | `gpt-5.1-codex-mini` | GPT-5.1 Codex Mini (medium/high) |
+| `codex-mini-latest` | Alias for the latest Codex Mini |
+
+Codex OAuth model policy in this package:
+- Allowed: model IDs containing `codex`, plus `gpt-5.2`
+- Rejected by validation: non-codex GPT-5 variants such as `gpt-5.1`, `gpt-5-pro`, `gpt-5-spark`
 
 ## Features
 
@@ -231,14 +245,18 @@ ChatAntigravity(
 
 ```python
 ChatCodex(
-    model: str = "gpt-5.2-codex",             # Model name
-    temperature: float = None,                       # Sampling temperature
-    max_tokens: int = None,                         # Max output tokens
-    reasoning_effort: str = None,                   # Reasoning effort: none/low/medium/high/xhigh
-    auth: CodexAuth = None,                        # Optional auth override
-    account_id: str = None,                          # Optional account ID
+    model: str = "gpt-5.3-codex",             # Model name
+    temperature: float = None,                 # Sampling temperature
+    max_tokens: int = None,                    # Max output tokens
+    reasoning_effort: str = None,              # Optional override (none/low/medium/high/xhigh)
+    auth: CodexAuth = None,                    # Optional auth override
+    account_id: str = None,                    # Optional account ID
 )
 ```
+
+Notes:
+- If `reasoning_effort` is not provided, GPT-5 models default to `medium` with reasoning summary enabled.
+- The Codex request validator enforces the OAuth model policy before API calls.
 
 ### Methods
 
@@ -246,6 +264,14 @@ Both `ChatAntigravity` and `ChatCodex` support:
 - `invoke(messages)` - Generate a response
 - `stream(messages)` - Stream a response
 - `bind_tools(tools)` - Bind tools for function calling
+
+### Codex Error Normalization
+
+`ChatCodex` normalizes common backend error codes into clearer messages:
+- `context_length_exceeded` → input exceeds model context window
+- `insufficient_quota` → quota/billing message
+- `usage_not_included` (and related plan text) → ChatGPT Plus upgrade guidance
+- `invalid_prompt` → provider message (or generic fallback)
 
 ## Migration from OpenCode
 

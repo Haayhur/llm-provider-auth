@@ -73,7 +73,7 @@ def get_thinking_config(model: str) -> dict[str, Any] | None:
     if "claude" in lower and "thinking" in lower:
         if "low" in lower:
             budget = constants.THINKING_BUDGETS["low"]
-        elif "high" in lower:
+        elif "high" in lower or "max" in lower:
             budget = constants.THINKING_BUDGETS["high"]
         else:
             budget = constants.THINKING_BUDGETS["medium"]
