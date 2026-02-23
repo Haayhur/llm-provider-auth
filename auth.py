@@ -81,6 +81,17 @@ class AntigravityAuth:
     def is_expired(self, buffer_seconds: int = 60) -> bool:
         return time.time() >= (self.expires_at - buffer_seconds)
     
+    def __repr__(self) -> str:
+        return (
+            f"AntigravityAuth("
+            f"access_token={'***' if self.access_token else None}, "
+            f"refresh_token={'***' if self.refresh_token else None}, "
+            f"expires_at={self.expires_at!r}, "
+            f"email={self.email!r}, "
+            f"project_id={self.project_id!r}, "
+            f"managed_project_id={self.managed_project_id!r})"
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "access_token": self.access_token,

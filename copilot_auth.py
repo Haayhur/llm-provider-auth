@@ -43,6 +43,18 @@ class CopilotAuth:
             return False
         return time.time() >= (self.expires_at - buffer_seconds)
 
+    def __repr__(self) -> str:
+        return (
+            f"CopilotAuth("
+            f"access_token={'***' if self.access_token else None}, "
+            f"expires_at={self.expires_at!r}, "
+            f"account_id={self.account_id!r}, "
+            f"login={self.login!r}, "
+            f"email={self.email!r}, "
+            f"provider={self.provider!r}, "
+            f"enterprise_url={self.enterprise_url!r})"
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "access_token": self.access_token,
