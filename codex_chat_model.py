@@ -70,7 +70,7 @@ _AUTH_METRICS: dict[str, int] = {
     "codex_unauthorized_retry_success": 0,
     "codex_unauthorized_retry_fail": 0,
 }
-_CODEX_OAUTH_ALLOWED_NON_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.2"})
+_CODEX_OAUTH_ALLOWED_NON_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.2", "gpt-5.4"})
 
 
 def _record_auth_metric(metric: str, **context: str | None) -> None:
@@ -95,6 +95,7 @@ class ChatCodex(BaseChatModel):
     LangChain ChatModel for OpenAI Codex API via ChatGPT OAuth.
 
     Supports:
+    - GPT-5.4 (low/medium/high/xhigh)
     - GPT-5.3 Codex (low/medium/high/xhigh)
     - GPT-5.2 models (none/low/medium/high/xhigh)
     - GPT-5.2 Codex (low/medium/high/xhigh)
@@ -440,6 +441,7 @@ class ChatCodex(BaseChatModel):
         """Parse Responses-style payload into an AIMessage."""
         output = response_data.get("output", [])
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
 
         if isinstance(output, list):
@@ -463,6 +465,22 @@ class ChatCodex(BaseChatModel):
                                 text = block.get("text") or block.get("value")
                                 if isinstance(text, str) and text:
                                     content_parts.append(text)
+                            elif block_type in ("summary_text", "reasoning_text"):
+                                text = block.get("text") or block.get("value")
+                                if isinstance(text, str) and text:
+                                    reasoning_parts.append(text)
+                elif item_type == "reasoning":
+                    summary = item.get("summary")
+                    if isinstance(summary, list):
+                        for block in summary:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") in ("summary_text", "reasoning_text", "text"):
+                                text = block.get("text") or block.get("value")
+                                if isinstance(text, str) and text:
+                                    reasoning_parts.append(text)
+                    elif isinstance(summary, str) and summary:
+                        reasoning_parts.append(summary)
                 elif item_type in ("function_call", "tool_call"):
                     name = item.get("name") or ""
                     args_raw = item.get("arguments")
@@ -477,8 +495,18 @@ class ChatCodex(BaseChatModel):
                     tool_calls.append(
                         ToolCall(name=name, args=args, id=item.get("id", ""))
                     )
+        response_metadata: dict[str, Any] = {}
+        if reasoning_parts:
+            response_metadata["reasoning"] = "\n\n".join(part.strip() for part in reasoning_parts if part.strip())
+        top_level_reasoning = response_data.get("reasoning")
+        if top_level_reasoning is not None and "reasoning" not in response_metadata:
+            response_metadata["reasoning"] = top_level_reasoning
 
-        return AIMessage(content="".join(content_parts), tool_calls=tool_calls)
+        return AIMessage(
+            content="".join(content_parts),
+            tool_calls=tool_calls,
+            response_metadata=response_metadata or None,
+        )
 
     def _convert_messages(self, messages: list[BaseMessage]) -> list[dict[str, Any]]:
         """Convert LangChain messages to ChatGPT Codex backend `input` format."""
@@ -528,7 +556,7 @@ class ChatCodex(BaseChatModel):
         if not self._is_allowed_codex_oauth_model(effective_model):
             raise ValueError(
                 f"Model '{effective_model}' is not available in Codex OAuth flow. "
-                "Use a Codex model or 'gpt-5.2'."
+                "Use a Codex model or one of: gpt-5.2, gpt-5.4."
             )
 
         # ChatGPT Codex backend requirements (mirrors Codex CLI behavior):

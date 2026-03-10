@@ -56,6 +56,11 @@ ANTIGRAVITY_ROUTE_MODELS = {
 CODEX_ROUTE_MODELS = {
     "gpt5": [
         {
+            "id": "gpt-5.4",
+            "name": "GPT-5.4",
+            "description": "GPT-5.4 base model retained by Codex OAuth flow",
+        },
+        {
             "id": "gpt-5.3-codex",
             "name": "GPT-5.3 Codex",
             "description": "Latest GPT-5 Codex model",
@@ -108,6 +113,7 @@ ANTIGRAVITY_PROFILE_MODELS = [
 ]
 
 CODEX_PROFILE_MODELS = [
+    {"id": "gpt-5.4", "name": "GPT-5.4"},
     {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
     {"id": "gpt-5-codex", "name": "GPT-5 Codex"},
     {"id": "gpt-5.2-codex", "name": "GPT-5.2 Codex"},
