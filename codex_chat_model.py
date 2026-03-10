@@ -134,6 +134,7 @@ class ChatCodex(BaseChatModel):
     """Optional callback invoked after auth refresh to persist updated tokens."""
 
     _tools: list[dict[str, Any]] = []
+    _tool_choice: str | dict[str, Any] | None = PrivateAttr(default=None)
     _auth_refresh_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
     @property
@@ -152,6 +153,12 @@ class ChatCodex(BaseChatModel):
         **kwargs: Any,
     ) -> "ChatCodex":
         """Bind tools to model."""
+        if tool_choice == "none":
+            new_model = self.model_copy()
+            new_model._tools = []
+            new_model._tool_choice = None
+            return new_model
+
         function_declarations = []
 
         for tool in tools:
@@ -202,6 +209,10 @@ class ChatCodex(BaseChatModel):
 
         new_model = self.model_copy()
         new_model._tools = function_declarations
+        if tool_choice in {"auto", "required"}:
+            new_model._tool_choice = tool_choice
+        else:
+            new_model._tool_choice = None
         return new_model
 
     async def _ensure_auth(self) -> CodexAuth:
@@ -493,7 +504,7 @@ class ChatCodex(BaseChatModel):
                         except json.JSONDecodeError:
                             args = {}
                     tool_calls.append(
-                        ToolCall(name=name, args=args, id=item.get("id", ""))
+                        ToolCall(name=name, args=args, id=item.get("call_id") or item.get("id", ""))
                     )
         response_metadata: dict[str, Any] = {}
         if reasoning_parts:
@@ -511,6 +522,33 @@ class ChatCodex(BaseChatModel):
     def _convert_messages(self, messages: list[BaseMessage]) -> list[dict[str, Any]]:
         """Convert LangChain messages to ChatGPT Codex backend `input` format."""
         input_items: list[dict[str, Any]] = []
+
+        def _tool_call_parts(tool_call: Any) -> tuple[str, str, str]:
+            name = ""
+            call_id = ""
+            args: Any = {}
+            if isinstance(tool_call, dict):
+                function = tool_call.get("function")
+                if isinstance(function, dict):
+                    name = str(function.get("name") or "").strip()
+                    args = function.get("arguments")
+                name = name or str(tool_call.get("name") or "").strip()
+                args = tool_call.get("args", args)
+                call_id = str(tool_call.get("call_id") or tool_call.get("tool_call_id") or tool_call.get("id") or "").strip()
+            else:
+                name = str(getattr(tool_call, "name", "") or "").strip()
+                args = getattr(tool_call, "args", {})
+                call_id = str(
+                    getattr(tool_call, "call_id", None)
+                    or getattr(tool_call, "tool_call_id", None)
+                    or getattr(tool_call, "id", "")
+                    or ""
+                ).strip()
+            if isinstance(args, str):
+                args_str = args
+            else:
+                args_str = json.dumps(args or {}, default=str)
+            return name, call_id, args_str
 
         for msg in messages:
             if isinstance(msg, SystemMessage):
@@ -534,14 +572,31 @@ class ChatCodex(BaseChatModel):
                         "role": "assistant",
                         "content": content,
                     })
+                for tool_call in list(getattr(msg, "tool_calls", None) or []):
+                    name, call_id, args_str = _tool_call_parts(tool_call)
+                    if not name or not call_id:
+                        continue
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": args_str,
+                    })
             elif isinstance(msg, ToolMessage):
-                # Tool results can be represented as messages for minimal compatibility.
-                # (Full function_call_output wiring can be added later if needed.)
-                input_items.append({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": msg.content,
-                })
+                tool_call_id = str(getattr(msg, "tool_call_id", "") or "").strip()
+                if tool_call_id:
+                    output = msg.content if isinstance(msg.content, str) else json.dumps(msg.content, default=str)
+                    input_items.append({
+                        "type": "function_call_output",
+                        "call_id": tool_call_id,
+                        "output": output,
+                    })
+                elif msg.content:
+                    input_items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": msg.content,
+                    })
 
         return input_items
 
@@ -585,6 +640,8 @@ class ChatCodex(BaseChatModel):
 
         if self._tools:
             body["tools"] = self._tools
+            if self._tool_choice is not None:
+                body["tool_choice"] = self._tool_choice
 
         return body
 
