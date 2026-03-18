@@ -61,9 +61,19 @@ CODEX_ROUTE_MODELS = {
             "description": "GPT-5.4 base model retained by Codex OAuth flow",
         },
         {
+            "id": "gpt-5.4-mini",
+            "name": "GPT-5.4 Mini",
+            "description": "Smaller GPT-5.4 Codex-compatible model",
+        },
+        {
             "id": "gpt-5.3-codex",
             "name": "GPT-5.3 Codex",
             "description": "Latest GPT-5 Codex model",
+        },
+        {
+            "id": "gpt-5.3-codex-spark",
+            "name": "GPT-5.3 Codex Spark",
+            "description": "Fast GPT-5.3 Codex variant",
         },
         {
             "id": "gpt-5-codex",
@@ -114,7 +124,9 @@ ANTIGRAVITY_PROFILE_MODELS = [
 
 CODEX_PROFILE_MODELS = [
     {"id": "gpt-5.4", "name": "GPT-5.4"},
+    {"id": "gpt-5.4-mini", "name": "GPT-5.4 Mini"},
     {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
+    {"id": "gpt-5.3-codex-spark", "name": "GPT-5.3 Codex Spark"},
     {"id": "gpt-5-codex", "name": "GPT-5 Codex"},
     {"id": "gpt-5.2-codex", "name": "GPT-5.2 Codex"},
     {"id": "gpt-5.1-codex", "name": "GPT-5.1 Codex"},

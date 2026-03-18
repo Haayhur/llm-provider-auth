@@ -249,14 +249,31 @@ ChatCodex(
     temperature: float = None,                 # Sampling temperature
     max_tokens: int = None,                    # Max output tokens
     reasoning_effort: str = None,              # Optional override (none/low/medium/high/xhigh)
+    metadata: dict = None,                     # Optional Responses API metadata
+    include: list[str] = None,                 # Optional Responses API include fields
+    text: dict = None,                         # Optional Responses API text config
+    truncation: str | dict = None,             # Optional Responses API truncation config
+    parallel_tool_calls: bool = None,          # Optional Responses API parallel tool setting
+    auto_execute_tools: bool = True,           # Auto-run bound function tools
+    stream_structured_events: bool = False,    # Emit non-text stream events as chunks
+    previous_response_id: str = None,          # Optional fixed Responses follow-up id
+    computer_executor: callable = None,        # Optional host executor for computer_use_preview
+    computer_loop_max_steps: int = 8,          # Max computer-use follow-up steps
+    computer_loop_timeout_seconds: float = None,  # Optional timeout per computer-use step
     auth: CodexAuth = None,                    # Optional auth override
     account_id: str = None,                    # Optional account ID
+    extra_body: dict = None,                   # Extra Responses API fields
 )
 ```
 
 Notes:
 - If `reasoning_effort` is not provided, GPT-5 models default to `medium` with reasoning summary enabled.
 - The Codex request validator enforces the OAuth model policy before API calls.
+- Bound function tools are auto-executed by default. Set `auto_execute_tools=False` to get legacy `.tool_calls` behavior.
+- Auto-executed function-tool traces are stored in `response_metadata["handled_tool_calls"]`.
+- Auto-executed computer-use traces are stored in `response_metadata["handled_computer_calls"]`.
+- Raw Responses output items are preserved in `additional_kwargs["codex_output_items"]` and `response_metadata["codex_output_items"]`.
+- Prior assistant `response_id` values are reused automatically on the next turn unless you explicitly override `previous_response_id`.
 
 ### Methods
 
@@ -264,6 +281,94 @@ Both `ChatAntigravity` and `ChatCodex` support:
 - `invoke(messages)` - Generate a response
 - `stream(messages)` - Stream a response
 - `bind_tools(tools)` - Bind tools for function calling
+
+`ChatCodex` also supports:
+- `bind_native_tools(tools)` - Bind provider-native Responses tools such as `{"type": "web_search"}`
+- `bind_file_search_tools(...)` - Convenience helper for native `file_search`
+- `bind_code_interpreter_tools(...)` - Convenience helper for native `code_interpreter`
+- `bind_computer_use_tools(...)` - Convenience helper for native `computer_use_preview`
+- `bind_mcp_tools(...)` - Convenience helper for native remote MCP tools
+- `with_input_items(items)` - Attach exact Responses follow-up items to the next request
+
+Example:
+
+```python
+def lookup_reference(*, query: str):
+    return [{"title": f"hit:{query}"}]
+
+chat = ChatCodex(model="gpt-5.3-codex").bind_tools([lookup_reference])
+response = chat.invoke("Find polymer references")
+
+print(response.content)
+print(response.response_metadata["handled_tool_calls"])
+```
+
+Native hosted-tool example:
+
+```python
+from langchain_core.messages import HumanMessage
+
+chat = (
+    ChatCodex(model="gpt-5.3-codex")
+    .bind_file_search_tools(vector_store_ids=["vs_123"], include_results=True)
+    .bind_code_interpreter_tools(container={"type": "auto"}, reuse_previous_container=True)
+)
+
+response = chat.invoke(
+    [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "Find the most relevant paper and summarize it."},
+                {"type": "image_url", "image_url": {"url": "https://example.com/figure.png", "detail": "high"}},
+            ]
+        )
+    ]
+)
+
+print(response.response_metadata["response_id"])
+print(response.response_metadata.get("file_search_results"))
+print(response.response_metadata.get("code_interpreter"))
+```
+
+Computer-use example:
+
+```python
+def run_browser_step(computer_call: dict) -> dict:
+    # Return a valid Responses computer_call_output payload.
+    return {
+        "output": {"image_url": "data:image/png;base64,..."},
+        "current_url": "https://example.com",
+    }
+
+chat = ChatCodex(computer_executor=run_browser_step).bind_computer_use_tools(
+    display_width=1440,
+    display_height=900,
+    environment="browser",
+)
+```
+
+Native Responses notes:
+- Vision inputs: pass OpenAI-style content blocks in `HumanMessage.content`, including `{"type": "image_url", ...}` or `{"type": "input_image", ...}`. `ChatCodex` normalizes them into Responses `input_image` items.
+- Raw input escape hatch: attach `additional_kwargs["codex_input_items"]` to any message, or use `with_input_items(...)`, to append exact Responses input items such as approval responses or future tool payloads.
+- `previous_response_id` is supported as a constructor field or per-call kwarg, and prior assistant `response_id` values are reused automatically on the next turn unless explicitly overridden.
+- The resolved follow-up id is exposed as `response_metadata["previous_response_id_used"]`.
+- File-search results are exposed in `response_metadata["file_search_results"]`.
+- Code-interpreter metadata is exposed in `response_metadata["code_interpreter"]`; `bind_code_interpreter_tools(..., reuse_previous_container=True)` reuses the latest seen container id.
+- Computer-use calls are exposed in `response_metadata["computer_calls"]`; if `computer_executor` is configured, ChatCodex will send `computer_call_output` items automatically until the turn completes.
+- MCP calls are exposed in `response_metadata["mcp_calls"]`, and approval items in `response_metadata["mcp_approvals"]`. Use `build_mcp_approval_item(...)` from `langchain_antigravity.codex_responses` to construct approval responses safely.
+- `with_input_items(...)` is model-level. Use it for reusable follow-up items; use per-message `codex_input_items` when the items belong to one specific turn.
+
+Common response metadata:
+- `reasoning` - flattened reasoning summary text
+- `response_id` - current Responses id
+- `previous_response_id_used` - follow-up id sent on this request
+- `native_tool_events` - normalized native `*_call` items
+- `file_search_results` - included file search result payloads
+- `code_interpreter` - latest parsed container/file ids
+- `computer_calls` - parsed computer-use calls
+- `handled_tool_calls` - local function-tool executions performed by `ChatCodex`
+- `handled_computer_calls` - local computer-use executions performed by `ChatCodex`
+- `mcp_calls` / `mcp_approvals` - separated MCP call and approval items
 
 ### Codex Error Normalization
 

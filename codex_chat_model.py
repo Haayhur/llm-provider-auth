@@ -9,9 +9,9 @@ and Codex models using a ChatGPT subscription.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
-import time
 from typing import Any, AsyncIterator, Callable, Sequence
 
 import httpx
@@ -30,6 +30,18 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.tools import BaseTool
 from pydantic import Field, PrivateAttr
 
+from .codex_responses import (
+    ResponsesSseAccumulator,
+    latest_code_interpreter_container_id,
+    latest_response_id,
+    message_additional_input_items,
+    normalize_responses_message_content,
+    normalize_responses_input_items,
+    parse_responses_output,
+    replayable_output_items,
+    serialize_function_call_output,
+    split_bound_tools,
+)
 from .usage_helpers import _extract_usage_metadata, _normalize_token_usage
 
 try:
@@ -124,16 +136,59 @@ class ChatCodex(BaseChatModel):
     reasoning_effort: str | None = Field(default=None)
     """Reasoning effort: none, low, medium, high, xhigh."""
 
+    metadata: dict[str, Any] | None = Field(default=None)
+    """Optional Responses API metadata payload."""
+
+    include: list[str] | None = Field(default=None)
+    """Optional Responses API include fields."""
+
+    text: dict[str, Any] | None = Field(default=None)
+    """Optional Responses API text configuration."""
+
+    truncation: str | dict[str, Any] | None = Field(default=None)
+    """Optional Responses API truncation mode/config."""
+
+    parallel_tool_calls: bool | None = Field(default=None)
+    """Optional Responses API parallel tool calling toggle."""
+
+    stream_structured_events: bool = Field(default=False)
+    """Emit non-text Responses events as empty-content stream chunks when enabled."""
+
+    auto_execute_tools: bool = Field(default=True)
+    """Execute bound function tools inside ChatCodex until the turn completes."""
+
+    max_tool_rounds: int = Field(default=8)
+    """Maximum number of internal function-tool execution rounds."""
+
+    previous_response_id: str | None = Field(default=None)
+    """Optional Responses API previous_response_id passthrough."""
+
+    computer_executor: Callable[[dict[str, Any]], Any] | None = Field(default=None, exclude=True)
+    """Optional computer-use host executor that returns a computer_call_output item."""
+
+    computer_loop_max_steps: int = Field(default=8)
+    """Maximum number of computer-use host execution steps."""
+
+    computer_loop_timeout_seconds: float | None = Field(default=None)
+    """Optional timeout per computer-use host execution step."""
+
     auth: CodexAuth | None = Field(default=None, exclude=True)
     """Authentication state. If not provided, will load from storage."""
 
     account_id: str | None = Field(default=None)
     """Optional ChatGPT account ID override."""
 
+    extra_body: dict[str, Any] | None = Field(default=None, exclude=True)
+    """Additional Responses API request fields to merge in."""
+
     on_auth_update: Callable[[CodexAuth], Any] | None = Field(default=None, exclude=True)
     """Optional callback invoked after auth refresh to persist updated tokens."""
 
-    _tools: list[dict[str, Any]] = []
+    _tools: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _native_tools: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _bound_tools: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _default_input_items: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _reuse_previous_code_interpreter_container: bool = PrivateAttr(default=False)
     _tool_choice: str | dict[str, Any] | None = PrivateAttr(default=None)
     _auth_refresh_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
@@ -156,63 +211,135 @@ class ChatCodex(BaseChatModel):
         if tool_choice == "none":
             new_model = self.model_copy()
             new_model._tools = []
+            new_model._native_tools = []
+            new_model._bound_tools = {}
             new_model._tool_choice = None
             return new_model
 
-        function_declarations = []
-
+        function_declarations, native_tools = split_bound_tools(tools)
+        executable_tools: dict[str, Any] = {}
         for tool in tools:
-            if isinstance(tool, dict):
-                # Accept either an already-shaped Responses tool object or a plain
-                # function schema with name/description/parameters.
-                if tool.get("type") == "function" and isinstance(tool.get("name"), str):
-                    function_declarations.append(tool)
-                else:
-                    function_declarations.append({
-                        "type": "function",
-                        "name": tool.get("name", ""),
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters", {}) or {},
-                    })
-            elif isinstance(tool, type):
-                schema = {}
-                function_declarations.append({
-                    "type": "function",
-                    "name": tool.__name__,
-                    "description": tool.__doc__ or "",
-                    "parameters": schema,
-                })
-            elif isinstance(tool, Callable) and not isinstance(tool, type):
-                schema = {}
-                function_declarations.append({
-                    "type": "function",
-                    "name": tool.__name__,
-                    "description": tool.__doc__ or "",
-                    "parameters": schema,
-                })
-            elif hasattr(tool, "name") and hasattr(tool, "description"):
-                schema: Any = {}
-                try:
-                    if hasattr(tool, "args_schema") and tool.args_schema:
-                        schema_result = getattr(tool.args_schema, "model_json_schema", lambda: {})()
-                        if isinstance(schema_result, dict):
-                            schema = schema_result
-                except Exception:
-                    pass
-
-                function_declarations.append({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": schema,
-                })
+            if isinstance(tool, dict) or isinstance(tool, type):
+                continue
+            if hasattr(tool, "name") and str(getattr(tool, "name", "") or "").strip():
+                executable_tools[str(getattr(tool, "name")).strip()] = tool
+                continue
+            if callable(tool):
+                name = str(getattr(tool, "__name__", "") or "").strip()
+                if name:
+                    executable_tools[name] = tool
 
         new_model = self.model_copy()
         new_model._tools = function_declarations
+        new_model._native_tools = native_tools
+        new_model._bound_tools = executable_tools
         if tool_choice in {"auto", "required"}:
             new_model._tool_choice = tool_choice
         else:
             new_model._tool_choice = None
+        return new_model
+
+    def bind_native_tools(
+        self,
+        native_tools: Sequence[dict[str, Any]],
+        *,
+        merge: bool = True,
+    ) -> "ChatCodex":
+        """Bind provider-native Responses API tools without coercing them to functions."""
+        new_model = self.model_copy()
+        if merge:
+            new_model._native_tools = [*self._native_tools, *[dict(tool) for tool in native_tools if isinstance(tool, dict)]]
+        else:
+            new_model._native_tools = [dict(tool) for tool in native_tools if isinstance(tool, dict)]
+        new_model._bound_tools = dict(self._bound_tools)
+        return new_model
+
+    def bind_file_search_tools(
+        self,
+        *,
+        vector_store_ids: Sequence[str],
+        filters: dict[str, Any] | None = None,
+        max_num_results: int | None = None,
+        include_results: bool = False,
+        merge: bool = True,
+    ) -> "ChatCodex":
+        tool: dict[str, Any] = {"type": "file_search", "vector_store_ids": list(vector_store_ids)}
+        if filters is not None:
+            tool["filters"] = filters
+        if max_num_results is not None:
+            tool["max_num_results"] = max_num_results
+        model = self.bind_native_tools([tool], merge=merge)
+        if include_results:
+            include = list(model.include or [])
+            if "file_search_call.results" not in include:
+                include.append("file_search_call.results")
+            model.include = include
+        return model
+
+    def bind_code_interpreter_tools(
+        self,
+        *,
+        container: str | dict[str, Any] | None = None,
+        reuse_previous_container: bool = False,
+        merge: bool = True,
+    ) -> "ChatCodex":
+        tool: dict[str, Any] = {"type": "code_interpreter"}
+        if container is not None:
+            tool["container"] = container
+        model = self.bind_native_tools([tool], merge=merge)
+        model._reuse_previous_code_interpreter_container = reuse_previous_container
+        return model
+
+    def bind_computer_use_tools(
+        self,
+        *,
+        display_width: int | None = None,
+        display_height: int | None = None,
+        environment: str | None = None,
+        merge: bool = True,
+        **config: Any,
+    ) -> "ChatCodex":
+        tool: dict[str, Any] = {"type": "computer_use_preview"}
+        if display_width is not None and display_height is not None:
+            tool["display_width"] = display_width
+            tool["display_height"] = display_height
+        if environment is not None:
+            tool["environment"] = environment
+        tool.update({key: value for key, value in config.items() if value is not None})
+        model = self.bind_native_tools([tool], merge=merge)
+        if model.truncation is None:
+            model.truncation = "auto"
+        return model
+
+    def bind_mcp_tools(
+        self,
+        tools: Sequence[dict[str, Any]] | dict[str, Any],
+        *,
+        merge: bool = True,
+    ) -> "ChatCodex":
+        if isinstance(tools, dict):
+            tool_list = [tools]
+        else:
+            tool_list = [dict(tool) for tool in tools if isinstance(tool, dict)]
+        normalized_tools = []
+        for tool in tool_list:
+            normalized = dict(tool)
+            normalized.setdefault("type", "mcp")
+            normalized_tools.append(normalized)
+        return self.bind_native_tools(normalized_tools, merge=merge)
+
+    def with_input_items(
+        self,
+        items: Sequence[dict[str, Any]],
+        *,
+        merge: bool = True,
+    ) -> "ChatCodex":
+        new_model = self.model_copy()
+        normalized_items = [dict(item) for item in items if isinstance(item, dict)]
+        if merge:
+            new_model._default_input_items = [*self._default_input_items, *normalized_items]
+        else:
+            new_model._default_input_items = normalized_items
         return new_model
 
     async def _ensure_auth(self) -> CodexAuth:
@@ -430,6 +557,7 @@ class ChatCodex(BaseChatModel):
 
     def _parse_sse_final_response(self, sse_text: str) -> dict[str, Any] | None:
         """Extract the final Responses payload from an SSE stream."""
+        accumulator = ResponsesSseAccumulator()
         for raw_line in sse_text.splitlines():
             line = raw_line.strip()
             if not line.startswith("data: "):
@@ -441,83 +569,307 @@ class ChatCodex(BaseChatModel):
                 evt = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
-            evt_type = evt.get("type")
-            if evt_type in ("response.done", "response.completed"):
-                response_obj = evt.get("response")
-                if isinstance(response_obj, dict):
-                    return response_obj
-        return None
+            if isinstance(evt, dict):
+                accumulator.add_event(evt)
+        return accumulator.build_response()
+
+    def _raise_for_responses_payload_error(
+        self,
+        response_data: dict[str, Any],
+        *,
+        model: str,
+    ) -> None:
+        status = str(response_data.get("status") or "").strip().lower()
+        error = response_data.get("error")
+        if status == "failed" or error is not None:
+            error_text = error if isinstance(error, str) else json.dumps({"error": error}, default=str)
+            message = self._normalize_error_text(
+                model=model,
+                status_code=None,
+                error_text=error_text,
+            )
+            raise RuntimeError(f"Codex API error: {message}")
+        incomplete_details = response_data.get("incomplete_details")
+        if status == "incomplete" or incomplete_details is not None:
+            reason = ""
+            if isinstance(incomplete_details, dict):
+                reason = str(incomplete_details.get("reason") or "").strip()
+            if not reason:
+                reason = "unknown"
+            raise RuntimeError(f"Codex API incomplete response: {reason}")
 
     def _parse_responses_api_output(self, response_data: dict[str, Any]) -> AIMessage:
         """Parse Responses-style payload into an AIMessage."""
-        output = response_data.get("output", [])
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-
-        if isinstance(output, list):
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-
-                item_type = item.get("type")
-                if item_type == "message":
-                    # Responses API: message.content is usually an array of content blocks.
-                    content = item.get("content")
-                    if isinstance(content, str):
-                        if content:
-                            content_parts.append(content)
-                    elif isinstance(content, list):
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            block_type = block.get("type")
-                            if block_type in ("output_text", "text"):
-                                text = block.get("text") or block.get("value")
-                                if isinstance(text, str) and text:
-                                    content_parts.append(text)
-                            elif block_type in ("summary_text", "reasoning_text"):
-                                text = block.get("text") or block.get("value")
-                                if isinstance(text, str) and text:
-                                    reasoning_parts.append(text)
-                elif item_type == "reasoning":
-                    summary = item.get("summary")
-                    if isinstance(summary, list):
-                        for block in summary:
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") in ("summary_text", "reasoning_text", "text"):
-                                text = block.get("text") or block.get("value")
-                                if isinstance(text, str) and text:
-                                    reasoning_parts.append(text)
-                    elif isinstance(summary, str) and summary:
-                        reasoning_parts.append(summary)
-                elif item_type in ("function_call", "tool_call"):
-                    name = item.get("name") or ""
-                    args_raw = item.get("arguments")
-                    args: Any = {}
-                    if isinstance(args_raw, dict):
-                        args = args_raw
-                    elif isinstance(args_raw, str):
-                        try:
-                            args = json.loads(args_raw) if args_raw else {}
-                        except json.JSONDecodeError:
-                            args = {}
-                    tool_calls.append(
-                        ToolCall(name=name, args=args, id=item.get("call_id") or item.get("id", ""))
-                    )
+        parsed = parse_responses_output(response_data)
         response_metadata: dict[str, Any] = {}
-        if reasoning_parts:
-            response_metadata["reasoning"] = "\n\n".join(part.strip() for part in reasoning_parts if part.strip())
-        top_level_reasoning = response_data.get("reasoning")
-        if top_level_reasoning is not None and "reasoning" not in response_metadata:
-            response_metadata["reasoning"] = top_level_reasoning
+        if parsed.reasoning:
+            response_metadata["reasoning"] = parsed.reasoning
+        if parsed.codex_items:
+            response_metadata["codex_items"] = parsed.codex_items
+        if parsed.native_tool_events:
+            response_metadata["native_tool_events"] = parsed.native_tool_events
+        if parsed.file_search_results:
+            response_metadata["file_search_results"] = parsed.file_search_results
+        if parsed.code_interpreter:
+            response_metadata["code_interpreter"] = parsed.code_interpreter
+        if parsed.computer_calls:
+            response_metadata["computer_calls"] = parsed.computer_calls
+        if parsed.mcp_calls:
+            response_metadata["mcp_calls"] = parsed.mcp_calls
+        if parsed.mcp_approvals:
+            response_metadata["mcp_approvals"] = parsed.mcp_approvals
+        if parsed.response_id:
+            response_metadata["response_id"] = parsed.response_id
+        if parsed.raw_output_items:
+            response_metadata["codex_output_items"] = parsed.raw_output_items
 
         return AIMessage(
-            content="".join(content_parts),
-            tool_calls=tool_calls,
+            content=parsed.content,
+            tool_calls=[
+                ToolCall(name=tool_call["name"], args=tool_call["args"], id=tool_call["id"])
+                for tool_call in parsed.external_tool_calls
+            ],
+            additional_kwargs={"codex_output_items": parsed.raw_output_items} if parsed.raw_output_items else None,
             response_metadata=response_metadata or None,
         )
+
+    def _merge_combined_output_items(
+        self,
+        message: AIMessage,
+        output_items: list[dict[str, Any]],
+        handled_tool_calls: list[dict[str, Any]] | None = None,
+        handled_computer_calls: list[dict[str, Any]] | None = None,
+    ) -> AIMessage:
+        parsed = parse_responses_output({"output": output_items})
+        response_metadata = dict(getattr(message, "response_metadata", {}) or {})
+        if parsed.reasoning:
+            response_metadata["reasoning"] = parsed.reasoning
+        if parsed.codex_items:
+            response_metadata["codex_items"] = parsed.codex_items
+        if parsed.native_tool_events:
+            response_metadata["native_tool_events"] = parsed.native_tool_events
+        if parsed.file_search_results:
+            response_metadata["file_search_results"] = parsed.file_search_results
+        if parsed.code_interpreter:
+            response_metadata["code_interpreter"] = parsed.code_interpreter
+        if parsed.computer_calls:
+            response_metadata["computer_calls"] = parsed.computer_calls
+        if parsed.mcp_calls:
+            response_metadata["mcp_calls"] = parsed.mcp_calls
+        if parsed.mcp_approvals:
+            response_metadata["mcp_approvals"] = parsed.mcp_approvals
+        if parsed.response_id:
+            response_metadata["response_id"] = parsed.response_id
+        if handled_tool_calls:
+            response_metadata["handled_tool_calls"] = handled_tool_calls
+        if handled_computer_calls:
+            response_metadata["handled_computer_calls"] = handled_computer_calls
+        if output_items:
+            response_metadata["codex_output_items"] = output_items
+        additional_kwargs = dict(getattr(message, "additional_kwargs", {}) or {})
+        if output_items:
+            additional_kwargs["codex_output_items"] = output_items
+        update = {
+            "tool_calls": [],
+            "additional_kwargs": additional_kwargs or None,
+            "response_metadata": response_metadata or None,
+        }
+        if hasattr(message, "model_copy"):
+            return message.model_copy(update=update)
+        return AIMessage(
+            content=message.content,
+            tool_calls=[],
+            usage_metadata=getattr(message, "usage_metadata", None) or None,
+            additional_kwargs=additional_kwargs or None,
+            response_metadata=response_metadata or None,
+        )
+
+    def _tool_call_signature(self, tool_call: dict[str, Any]) -> str:
+        name = str(tool_call.get("name") or "").strip()
+        args = tool_call.get("args") or {}
+        return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+
+    def _resolve_previous_response_id(
+        self,
+        messages: Sequence[BaseMessage],
+        explicit_previous_response_id: str | None = None,
+    ) -> str | None:
+        if explicit_previous_response_id is not None:
+            value = str(explicit_previous_response_id or "").strip()
+            return value or None
+        derived = latest_response_id(messages)
+        if derived:
+            return derived
+        configured = str(self.previous_response_id or "").strip()
+        return configured or None
+
+    def _resolve_request_tools(self, messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+        tools = [dict(tool) for tool in [*self._tools, *self._native_tools]]
+        if not self._reuse_previous_code_interpreter_container:
+            return tools
+        container_id = latest_code_interpreter_container_id(messages)
+        if not container_id:
+            return tools
+        resolved_tools: list[dict[str, Any]] = []
+        for tool in tools:
+            if str(tool.get("type") or "").strip() == "code_interpreter":
+                resolved_tool = dict(tool)
+                resolved_tool["container"] = container_id
+                resolved_tools.append(resolved_tool)
+                continue
+            resolved_tools.append(tool)
+        return resolved_tools
+
+    def _apply_request_context_metadata(
+        self,
+        message: AIMessage,
+        *,
+        previous_response_id_used: str | None = None,
+    ) -> AIMessage:
+        if not previous_response_id_used:
+            return message
+        response_metadata = dict(getattr(message, "response_metadata", {}) or {})
+        response_metadata["previous_response_id_used"] = previous_response_id_used
+        if hasattr(message, "model_copy"):
+            return message.model_copy(update={"response_metadata": response_metadata or None})
+        return AIMessage(
+            content=message.content,
+            tool_calls=getattr(message, "tool_calls", None) or [],
+            usage_metadata=getattr(message, "usage_metadata", None) or None,
+            additional_kwargs=getattr(message, "additional_kwargs", None) or None,
+            response_metadata=response_metadata or None,
+        )
+
+    def _computer_call_signature(self, computer_call: dict[str, Any]) -> str:
+        action = computer_call.get("action")
+        call_id = str(computer_call.get("call_id") or computer_call.get("id") or "").strip()
+        return f"{call_id}:{json.dumps(action, sort_keys=True, default=str)}"
+
+    def _has_assistant_message_item(self, output_items: list[dict[str, Any]]) -> bool:
+        return any(
+            isinstance(item, dict)
+            and item.get("type") == "message"
+            and item.get("role", "assistant") == "assistant"
+            for item in output_items
+        )
+
+    async def _invoke_bound_tool(self, tool: Any, args: dict[str, Any]) -> Any:
+        if hasattr(tool, "ainvoke") and callable(getattr(tool, "ainvoke")):
+            return await tool.ainvoke(args)
+        if hasattr(tool, "invoke") and callable(getattr(tool, "invoke")):
+            return tool.invoke(args)
+        if hasattr(tool, "arun") and callable(getattr(tool, "arun")):
+            return await tool.arun(**args)
+        if hasattr(tool, "run") and callable(getattr(tool, "run")):
+            return tool.run(**args)
+        if callable(tool):
+            try:
+                result = tool(**args)
+            except TypeError:
+                result = tool(args)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        raise RuntimeError(f"Bound tool is not executable: {tool!r}")
+
+    async def _invoke_computer_executor(self, computer_call: dict[str, Any]) -> dict[str, Any]:
+        if self.computer_executor is None:
+            raise RuntimeError("Codex computer_use_preview requested without a configured computer_executor")
+        result = self.computer_executor(computer_call)
+        if inspect.isawaitable(result):
+            if self.computer_loop_timeout_seconds is not None:
+                result = await asyncio.wait_for(result, timeout=self.computer_loop_timeout_seconds)
+            else:
+                result = await result
+        if self.computer_loop_timeout_seconds is not None and not inspect.isawaitable(result):
+            pass
+        if not isinstance(result, dict):
+            raise RuntimeError("computer_executor must return a dict representing computer_call_output")
+
+        call_id = str(computer_call.get("call_id") or computer_call.get("id") or "").strip()
+        if result.get("type") == "computer_call_output":
+            output_item = dict(result)
+            output_item.setdefault("call_id", call_id)
+            return output_item
+
+        output_payload = dict(result)
+        if "output" not in output_payload:
+            if "image_url" in output_payload or "file_id" in output_payload:
+                output_payload = {"output": output_payload}
+            else:
+                raise RuntimeError("computer_executor result must contain 'output' or screenshot fields")
+        return {
+            "type": "computer_call_output",
+            "call_id": call_id,
+            **output_payload,
+        }
+
+    async def _execute_bound_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        output_items: list[dict[str, Any]] = []
+        handled_tool_calls: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            tool_name = str(tool_call.get("name") or "").strip()
+            call_id = str(tool_call.get("id") or "").strip()
+            if not tool_name or not call_id:
+                continue
+            tool = self._bound_tools.get(tool_name)
+            if tool is None:
+                raise RuntimeError(f"Codex auto_execute_tools missing bound implementation for '{tool_name}'")
+            success = True
+            try:
+                result = await self._invoke_bound_tool(tool, dict(tool_call.get("args") or {}))
+            except Exception as exc:
+                success = False
+                result = {"error": str(exc)}
+            output_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": serialize_function_call_output(result),
+                }
+            )
+            handled_tool_calls.append(
+                {
+                    "id": call_id,
+                    "name": tool_name,
+                    "args": dict(tool_call.get("args") or {}),
+                    "output": result,
+                    "success": success,
+                }
+            )
+        return output_items, handled_tool_calls
+
+    async def _execute_computer_calls(
+        self,
+        computer_calls: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        output_items: list[dict[str, Any]] = []
+        handled_calls: list[dict[str, Any]] = []
+        for computer_call in computer_calls:
+            call_id = str(computer_call.get("call_id") or computer_call.get("id") or "").strip()
+            success = True
+            try:
+                output_item = await self._invoke_computer_executor(computer_call)
+            except Exception as exc:
+                success = False
+                output_item = {
+                    "type": "computer_call_output",
+                    "call_id": call_id,
+                    "output": {"error": str(exc)},
+                }
+            output_items.append(output_item)
+            handled_calls.append(
+                {
+                    "id": call_id,
+                    "action": computer_call.get("action"),
+                    "output": output_item.get("output"),
+                    "success": success,
+                }
+            )
+        return output_items, handled_calls
 
     def _convert_messages(self, messages: list[BaseMessage]) -> list[dict[str, Any]]:
         """Convert LangChain messages to ChatGPT Codex backend `input` format."""
@@ -555,37 +907,61 @@ class ChatCodex(BaseChatModel):
                 input_items.append({
                     "type": "message",
                     "role": "developer",
-                    "content": msg.content,
+                    "content": normalize_responses_message_content(msg.content),
                 })
+                input_items.extend(message_additional_input_items(msg))
             elif isinstance(msg, HumanMessage):
                 input_items.append({
                     "type": "message",
                     "role": "user",
-                    "content": msg.content,
+                    "content": normalize_responses_message_content(msg.content),
                 })
+                input_items.extend(message_additional_input_items(msg))
             elif isinstance(msg, AIMessage):
-                # Preserve assistant text in history when provided.
+                replay_items = replayable_output_items(msg)
+                if replay_items:
+                    input_items.extend(replay_items)
+                    has_message_item = any(
+                        isinstance(item, dict)
+                        and item.get("type") == "message"
+                        and item.get("role") == "assistant"
+                        for item in replay_items
+                    )
+                    has_tool_call_item = any(
+                        isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}
+                        for item in replay_items
+                    )
+                else:
+                    has_message_item = False
+                    has_tool_call_item = False
+
                 content = msg.content or ""
-                if content:
+                if content and not has_message_item:
                     input_items.append({
                         "type": "message",
                         "role": "assistant",
-                        "content": content,
+                        "content": normalize_responses_message_content(content),
                     })
-                for tool_call in list(getattr(msg, "tool_calls", None) or []):
-                    name, call_id, args_str = _tool_call_parts(tool_call)
-                    if not name or not call_id:
-                        continue
-                    input_items.append({
-                        "type": "function_call",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": args_str,
-                    })
+                if not has_tool_call_item:
+                    for tool_call in list(getattr(msg, "tool_calls", None) or []):
+                        name, call_id, args_str = _tool_call_parts(tool_call)
+                        if not name or not call_id:
+                            continue
+                        input_items.append({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": args_str,
+                        })
+                input_items.extend(message_additional_input_items(msg))
             elif isinstance(msg, ToolMessage):
                 tool_call_id = str(getattr(msg, "tool_call_id", "") or "").strip()
                 if tool_call_id:
-                    output = msg.content if isinstance(msg.content, str) else json.dumps(msg.content, default=str)
+                    additional_kwargs = getattr(msg, "additional_kwargs", None)
+                    if isinstance(additional_kwargs, dict) and "codex_function_call_output" in additional_kwargs:
+                        output = additional_kwargs["codex_function_call_output"]
+                    else:
+                        output = serialize_function_call_output(msg.content)
                     input_items.append({
                         "type": "function_call_output",
                         "call_id": tool_call_id,
@@ -595,16 +971,27 @@ class ChatCodex(BaseChatModel):
                     input_items.append({
                         "type": "message",
                         "role": "assistant",
-                        "content": msg.content,
+                        "content": normalize_responses_message_content(msg.content),
                     })
+                input_items.extend(message_additional_input_items(msg))
 
-        return input_items
+        input_items.extend(dict(item) for item in self._default_input_items)
+        return normalize_responses_input_items(input_items)
 
     def _build_request_body(
         self,
         input_items: list[dict[str, Any]],
         instructions: str,
         stream: bool = False,
+        *,
+        metadata: dict[str, Any] | None = None,
+        include: list[str] | None = None,
+        text: dict[str, Any] | None = None,
+        truncation: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        previous_response_id: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build Codex API request body."""
         effective_model = normalize_codex_model(self.model)
@@ -638,10 +1025,52 @@ class ChatCodex(BaseChatModel):
         elif self._should_apply_default_reasoning(effective_model):
             body["reasoning"] = {"effort": "medium", "summary": "auto"}
 
-        if self._tools:
-            body["tools"] = self._tools
+        metadata_payload = metadata if metadata is not None else self.metadata
+        if metadata_payload is not None:
+            body["metadata"] = metadata_payload
+        include_payload = include if include is not None else self.include
+        if include_payload is not None:
+            body["include"] = include_payload
+        text_payload = text if text is not None else self.text
+        if text_payload is not None:
+            body["text"] = text_payload
+        truncation_payload = truncation if truncation is not None else self.truncation
+        if truncation_payload is not None:
+            body["truncation"] = truncation_payload
+        parallel_tool_calls_payload = (
+            parallel_tool_calls if parallel_tool_calls is not None else self.parallel_tool_calls
+        )
+        if parallel_tool_calls_payload is not None:
+            body["parallel_tool_calls"] = parallel_tool_calls_payload
+        previous_response_id_payload = (
+            previous_response_id if previous_response_id is not None else self.previous_response_id
+        )
+        if previous_response_id_payload is not None:
+            body["previous_response_id"] = previous_response_id_payload
+
+        request_tools = [dict(tool) for tool in tools] if tools is not None else [*self._tools, *self._native_tools]
+        if request_tools:
+            body["tools"] = request_tools
             if self._tool_choice is not None:
                 body["tool_choice"] = self._tool_choice
+
+        merged_extra_body = dict(self.extra_body or {})
+        if extra_body:
+            merged_extra_body.update(extra_body)
+        if merged_extra_body:
+            reserved_keys = {
+                "model",
+                "instructions",
+                "store",
+                "stream",
+                "input",
+                "tools",
+                "tool_choice",
+            }
+            for key, value in merged_extra_body.items():
+                if key in reserved_keys:
+                    continue
+                body[key] = value
 
         return body
 
@@ -663,6 +1092,7 @@ class ChatCodex(BaseChatModel):
                 return base_message.model_copy(
                     update={
                         "usage_metadata": usage_metadata or None,
+                        "additional_kwargs": getattr(base_message, "additional_kwargs", None) or None,
                         "response_metadata": response_metadata or None,
                     }
                 )
@@ -670,6 +1100,7 @@ class ChatCodex(BaseChatModel):
                 content=base_message.content,
                 tool_calls=base_message.tool_calls,
                 usage_metadata=usage_metadata or None,
+                additional_kwargs=getattr(base_message, "additional_kwargs", None) or None,
                 response_metadata=response_metadata or None,
             )
 
@@ -718,9 +1149,23 @@ class ChatCodex(BaseChatModel):
         """Generate a response asynchronously."""
         auth = await self._ensure_auth()
         input_items = self._convert_messages(messages)
+        resolved_previous_response_id = self._resolve_previous_response_id(
+            messages,
+            explicit_previous_response_id=kwargs.get("previous_response_id"),
+        )
+        resolved_tools = self._resolve_request_tools(messages)
         effective_model = normalize_codex_model(self.model)
         instructions = get_codex_instructions(effective_model)
-        body = self._build_request_body(input_items, instructions, stream=False)
+        body_kwargs = {
+            "metadata": kwargs.get("metadata"),
+            "include": kwargs.get("include"),
+            "text": kwargs.get("text"),
+            "truncation": kwargs.get("truncation"),
+            "parallel_tool_calls": kwargs.get("parallel_tool_calls"),
+            "previous_response_id": resolved_previous_response_id,
+            "tools": resolved_tools,
+            "extra_body": kwargs.get("extra_body") or kwargs.get("responses_api_extra"),
+        }
 
         headers = {
             **CODEX_HEADERS,
@@ -737,51 +1182,118 @@ class ChatCodex(BaseChatModel):
         url = f"{CODEX_BASE_URL}/codex/responses"
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            for attempt in range(2):
-                response = await client.post(url, headers=headers, json=body)
+            combined_output_items: list[dict[str, Any]] = []
+            handled_tool_calls: list[dict[str, Any]] = []
+            handled_computer_calls: list[dict[str, Any]] = []
+            recent_tool_signatures: set[str] = set()
+            recent_computer_signatures: set[str] = set()
+            computer_steps = 0
+            for tool_round in range(self.max_tool_rounds + 1):
+                body = self._build_request_body(
+                    input_items,
+                    instructions,
+                    stream=False,
+                    **body_kwargs,
+                )
+                for attempt in range(2):
+                    response = await client.post(url, headers=headers, json=body)
 
-                if not response.is_success:
-                    error_text = self._extract_error_message(response, model=effective_model)
-                    if self._is_cloudflare_challenge(response.status_code, response.text):
-                        raise RuntimeError(
-                            "Codex request was blocked by Cloudflare on chatgpt.com (JS/cookie challenge). "
-                            "This usually happens when hitting the non-Codex endpoint or when requests are missing "
-                            "required headers. Re-run 'codex-auth login', ensure you are using the latest package, "
-                            "and retry."
-                        )
-                    if response.status_code == 401 and attempt == 0:
-                        await self._recover_after_unauthorized(auth)
-                        auth = self.auth or auth
-                        headers["Authorization"] = f"Bearer {auth.access_token}"
-                        if auth.account_id:
-                            headers["chatgpt-account-id"] = auth.account_id
-                        continue
-                    raise RuntimeError(f"Codex API error: {response.status_code} - {error_text}")
+                    if not response.is_success:
+                        error_text = self._extract_error_message(response, model=effective_model)
+                        if self._is_cloudflare_challenge(response.status_code, response.text):
+                            raise RuntimeError(
+                                "Codex request was blocked by Cloudflare on chatgpt.com (JS/cookie challenge). "
+                                "This usually happens when hitting the non-Codex endpoint or when requests are missing "
+                                "required headers. Re-run 'codex-auth login', ensure you are using the latest package, "
+                                "and retry."
+                            )
+                        if response.status_code == 401 and attempt == 0:
+                            await self._recover_after_unauthorized(auth)
+                            auth = self.auth or auth
+                            headers["Authorization"] = f"Bearer {auth.access_token}"
+                            if auth.account_id:
+                                headers["chatgpt-account-id"] = auth.account_id
+                            continue
+                        raise RuntimeError(f"Codex API error: {response.status_code} - {error_text}")
 
-                # Codex backend often returns SSE even when stream=false.
-                content_type = response.headers.get("content-type", "")
-                if "text/event-stream" in content_type.lower() or response.text.lstrip().startswith("data: "):
-                    final_response = self._parse_sse_final_response(response.text)
-                    if not final_response:
-                        raise RuntimeError("Codex API returned SSE but no final response.done event was found")
-                    message = self._parse_response(final_response)
-                else:
-                    try:
-                        response_data = response.json()
-                        message = self._parse_response(response_data)
-                    except json.JSONDecodeError:
-                        # Some deployments still return SSE without a helpful content-type.
+                    # Codex backend often returns SSE even when stream=false.
+                    content_type = response.headers.get("content-type", "")
+                    if "text/event-stream" in content_type.lower() or response.text.lstrip().startswith("data: "):
                         final_response = self._parse_sse_final_response(response.text)
                         if not final_response:
-                            raise
-                        message = self._parse_response(final_response)
+                            raise RuntimeError("Codex API returned SSE but no final response.done event was found")
+                        response_data = final_response
+                    else:
+                        try:
+                            response_data = response.json()
+                        except json.JSONDecodeError:
+                            final_response = self._parse_sse_final_response(response.text)
+                            if not final_response:
+                                raise
+                            response_data = final_response
 
-                llm_output = {"model_name": self.model}
-                if message.usage_metadata:
-                    llm_output["token_usage"] = _normalize_token_usage(message.usage_metadata)
-                return ChatResult(generations=[ChatGeneration(message=message)], llm_output=llm_output)
-
-            raise RuntimeError("Codex API error: unauthorized after token refresh")
+                    self._raise_for_responses_payload_error(response_data, model=effective_model)
+                    message = self._parse_response(response_data)
+                    if "output" in response_data and (self.auto_execute_tools or self.computer_executor is not None):
+                        parsed = parse_responses_output(response_data)
+                        if self._has_assistant_message_item(parsed.raw_output_items):
+                            recent_tool_signatures.clear()
+                            recent_computer_signatures.clear()
+                        if parsed.raw_output_items:
+                            combined_output_items.extend(parsed.raw_output_items)
+                        follow_up_items: list[dict[str, Any]] = []
+                        if parsed.computer_calls and self.computer_executor is not None:
+                            computer_steps += len(parsed.computer_calls)
+                            if computer_steps > self.computer_loop_max_steps:
+                                raise RuntimeError(
+                                    f"Codex computer_use_preview exceeded computer_loop_max_steps={self.computer_loop_max_steps}"
+                                )
+                            for computer_call in parsed.computer_calls:
+                                signature = self._computer_call_signature(computer_call)
+                                if signature in recent_computer_signatures:
+                                    raise RuntimeError(
+                                        "Codex computer_use_preview detected repeated computer call without new output"
+                                    )
+                                recent_computer_signatures.add(signature)
+                            computer_output_items, handled_computer_batch = await self._execute_computer_calls(parsed.computer_calls)
+                            combined_output_items.extend(computer_output_items)
+                            handled_computer_calls.extend(handled_computer_batch)
+                            follow_up_items.extend(computer_output_items)
+                        if self.auto_execute_tools and parsed.external_tool_calls:
+                            for tool_call in parsed.external_tool_calls:
+                                signature = self._tool_call_signature(tool_call)
+                                if signature in recent_tool_signatures:
+                                    raise RuntimeError(
+                                        f"Codex auto_execute_tools detected repeated tool call without assistant progress: {tool_call['name']}"
+                                    )
+                                recent_tool_signatures.add(signature)
+                            tool_output_items, handled_batch = await self._execute_bound_tool_calls(parsed.external_tool_calls)
+                            combined_output_items.extend(tool_output_items)
+                            handled_tool_calls.extend(handled_batch)
+                            follow_up_items.extend(tool_output_items)
+                        if follow_up_items:
+                            input_items.extend(parsed.raw_output_items)
+                            input_items.extend(follow_up_items)
+                            break
+                    llm_output = {"model_name": self.model}
+                    if message.usage_metadata:
+                        llm_output["token_usage"] = _normalize_token_usage(message.usage_metadata)
+                    if combined_output_items:
+                        message = self._merge_combined_output_items(
+                            message,
+                            combined_output_items,
+                            handled_tool_calls=handled_tool_calls,
+                            handled_computer_calls=handled_computer_calls,
+                        )
+                    message = self._apply_request_context_metadata(
+                        message,
+                        previous_response_id_used=resolved_previous_response_id,
+                    )
+                    return ChatResult(generations=[ChatGeneration(message=message)], llm_output=llm_output)
+                else:
+                    raise RuntimeError("Codex API error: unauthorized after token refresh")
+                continue
+            raise RuntimeError(f"Codex auto_execute_tools exceeded max_tool_rounds={self.max_tool_rounds}")
 
     def _generate(
         self,
@@ -805,9 +1317,24 @@ class ChatCodex(BaseChatModel):
         """Stream a response asynchronously."""
         auth = await self._ensure_auth()
         input_items = self._convert_messages(messages)
+        resolved_previous_response_id = self._resolve_previous_response_id(
+            messages,
+            explicit_previous_response_id=kwargs.get("previous_response_id"),
+        )
+        resolved_tools = self._resolve_request_tools(messages)
         effective_model = normalize_codex_model(self.model)
         instructions = get_codex_instructions(effective_model)
-        body = self._build_request_body(input_items, instructions, stream=True)
+        emit_structured_events = bool(kwargs.get("stream_structured_events", self.stream_structured_events))
+        body_kwargs = {
+            "metadata": kwargs.get("metadata"),
+            "include": kwargs.get("include"),
+            "text": kwargs.get("text"),
+            "truncation": kwargs.get("truncation"),
+            "parallel_tool_calls": kwargs.get("parallel_tool_calls"),
+            "previous_response_id": resolved_previous_response_id,
+            "tools": resolved_tools,
+            "extra_body": kwargs.get("extra_body") or kwargs.get("responses_api_extra"),
+        }
 
         headers = {
             **CODEX_HEADERS,
@@ -823,72 +1350,230 @@ class ChatCodex(BaseChatModel):
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             unauthorized_retry_attempted = False
-            saw_any_delta = False
-            for attempt in range(2):
-                async with client.stream("POST", url, headers=headers, json=body) as response:
-                    if not response.is_success:
-                        error_bytes = await response.aread()
-                        error_text = error_bytes.decode("utf-8", errors="replace")
-                        if self._is_cloudflare_challenge(response.status_code, error_text):
-                            raise RuntimeError(
-                                "Codex streaming request was blocked by Cloudflare on chatgpt.com (JS/cookie challenge). "
-                                "Re-run 'codex-auth login' and retry."
-                            )
-                        if response.status_code == 401 and attempt == 0:
-                            unauthorized_retry_attempted = True
-                            await self._recover_after_unauthorized(auth)
-                            auth = self.auth or auth
-                            headers["Authorization"] = f"Bearer {auth.access_token}"
-                            if auth.account_id:
-                                headers["chatgpt-account-id"] = auth.account_id
-                            continue
-                        error_text = self._normalize_error_text(
-                            model=effective_model,
-                            status_code=response.status_code,
-                            error_text=error_text,
-                        )
-                        raise RuntimeError(f"Codex API error: {response.status_code} - {error_text}")
-
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                return
-
-                            try:
-                                chunk_data = json.loads(data)
-                                evt_type = chunk_data.get("type")
-
-                                # Responses API streaming text
-                                if evt_type in ("response.output_text.delta", "response.output_text.fragment"):
-                                    delta_text = chunk_data.get("delta") or chunk_data.get("text")
-                                    if isinstance(delta_text, str) and delta_text:
-                                        saw_any_delta = True
-                                        yield ChatGenerationChunk(message=AIMessageChunk(content=delta_text))
-                                        continue
-
-                                # Some backends emit message deltas under nested paths.
-                                if evt_type == "response.output_item.delta":
-                                    delta = chunk_data.get("delta")
-                                    if isinstance(delta, dict):
-                                        content = delta.get("content")
-                                        if isinstance(content, list):
-                                            for block in content:
-                                                if not isinstance(block, dict):
-                                                    continue
-                                                if block.get("type") in ("output_text", "text"):
-                                                    text = block.get("text") or block.get("value")
-                                                    if isinstance(text, str) and text:
-                                                        saw_any_delta = True
-                                                        yield ChatGenerationChunk(
-                                                            message=AIMessageChunk(content=text)
-                                                        )
-                            except json.JSONDecodeError:
+            handled_tool_calls: list[dict[str, Any]] = []
+            handled_computer_calls: list[dict[str, Any]] = []
+            recent_tool_signatures: set[str] = set()
+            recent_computer_signatures: set[str] = set()
+            computer_steps = 0
+            for tool_round in range(self.max_tool_rounds + 1):
+                body = self._build_request_body(
+                    input_items,
+                    instructions,
+                    stream=True,
+                    **body_kwargs,
+                )
+                continue_tool_loop = False
+                for attempt in range(2):
+                    request_saw_delta = False
+                    async with client.stream("POST", url, headers=headers, json=body) as response:
+                        accumulator = ResponsesSseAccumulator()
+                        saw_done = False
+                        if not response.is_success:
+                            error_bytes = await response.aread()
+                            error_text = error_bytes.decode("utf-8", errors="replace")
+                            if self._is_cloudflare_challenge(response.status_code, error_text):
+                                raise RuntimeError(
+                                    "Codex streaming request was blocked by Cloudflare on chatgpt.com (JS/cookie challenge). "
+                                    "Re-run 'codex-auth login' and retry."
+                                )
+                            if response.status_code == 401 and attempt == 0:
+                                unauthorized_retry_attempted = True
+                                await self._recover_after_unauthorized(auth)
+                                auth = self.auth or auth
+                                headers["Authorization"] = f"Bearer {auth.access_token}"
+                                if auth.account_id:
+                                    headers["chatgpt-account-id"] = auth.account_id
                                 continue
-                    if saw_any_delta:
-                        _LOGGER.warning("Codex stream ended without [DONE]; returning partial response")
-                        return
-                    raise RuntimeError("Codex API stream ended unexpectedly before completion event")
-            if unauthorized_retry_attempted:
-                raise RuntimeError("Codex API error: unauthorized after token refresh")
-            raise RuntimeError("Codex API stream ended unexpectedly before completion event")
+                            error_text = self._normalize_error_text(
+                                model=effective_model,
+                                status_code=response.status_code,
+                                error_text=error_text,
+                            )
+                            raise RuntimeError(f"Codex API error: {response.status_code} - {error_text}")
+
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    saw_done = True
+                                    break
+
+                                try:
+                                    chunk_data = json.loads(data)
+                                    if isinstance(chunk_data, dict):
+                                        accumulator.add_event(chunk_data)
+                                    evt_type = chunk_data.get("type")
+
+                                    if evt_type in ("response.output_text.delta", "response.output_text.fragment"):
+                                        delta_text = chunk_data.get("delta") or chunk_data.get("text")
+                                        if isinstance(delta_text, str) and delta_text:
+                                            request_saw_delta = True
+                                            yield ChatGenerationChunk(message=AIMessageChunk(content=delta_text))
+                                            continue
+
+                                    if evt_type == "response.output_item.delta":
+                                        delta = chunk_data.get("delta")
+                                        if isinstance(delta, dict):
+                                            content = delta.get("content")
+                                            if isinstance(content, list):
+                                                for block in content:
+                                                    if not isinstance(block, dict):
+                                                        continue
+                                                    if block.get("type") in ("output_text", "text"):
+                                                        text = block.get("text") or block.get("value")
+                                                        if isinstance(text, str) and text:
+                                                            request_saw_delta = True
+                                                            yield ChatGenerationChunk(
+                                                                message=AIMessageChunk(content=text)
+                                                            )
+                                            continue
+
+                                    if evt_type in (
+                                        "response.reasoning_summary_text.delta",
+                                        "response.reasoning_text.delta",
+                                    ):
+                                        delta_text = chunk_data.get("delta") or chunk_data.get("text")
+                                        if isinstance(delta_text, str) and delta_text:
+                                            if emit_structured_events:
+                                                yield ChatGenerationChunk(
+                                                    message=AIMessageChunk(
+                                                        content="",
+                                                        additional_kwargs={
+                                                            "codex_event": {"type": evt_type, "delta": delta_text}
+                                                        },
+                                                    )
+                                                )
+                                            callback = getattr(run_manager, "on_custom_event", None)
+                                            if callable(callback):
+                                                maybe_result = callback(
+                                                    "codex.responses.reasoning.delta",
+                                                    {"type": evt_type, "delta": delta_text},
+                                                )
+                                                if asyncio.iscoroutine(maybe_result):
+                                                    await maybe_result
+                                            continue
+
+                                    if evt_type == "response.output_item.done":
+                                        item = chunk_data.get("item")
+                                        if isinstance(item, dict):
+                                            if emit_structured_events:
+                                                yield ChatGenerationChunk(
+                                                    message=AIMessageChunk(
+                                                        content="",
+                                                        additional_kwargs={"codex_event": {"type": evt_type, "item": item}},
+                                                    )
+                                                )
+                                            callback = getattr(run_manager, "on_custom_event", None)
+                                            if callable(callback):
+                                                maybe_result = callback(
+                                                    "codex.responses.output_item.done",
+                                                    {"item": item},
+                                                )
+                                                if asyncio.iscoroutine(maybe_result):
+                                                    await maybe_result
+                                except json.JSONDecodeError:
+                                    continue
+                        final_response = accumulator.build_response()
+                        if final_response:
+                            callback = getattr(run_manager, "on_custom_event", None)
+                            if callable(callback):
+                                maybe_result = callback(
+                                    "codex.responses.completed",
+                                    {"response": final_response},
+                                )
+                                if asyncio.iscoroutine(maybe_result):
+                                    await maybe_result
+                            self._raise_for_responses_payload_error(final_response, model=effective_model)
+                            if "output" in final_response and (self.auto_execute_tools or self.computer_executor is not None):
+                                parsed = parse_responses_output(final_response)
+                                if self._has_assistant_message_item(parsed.raw_output_items):
+                                    recent_tool_signatures.clear()
+                                    recent_computer_signatures.clear()
+                                follow_up_items: list[dict[str, Any]] = []
+                                if parsed.computer_calls and self.computer_executor is not None:
+                                    computer_steps += len(parsed.computer_calls)
+                                    if computer_steps > self.computer_loop_max_steps:
+                                        raise RuntimeError(
+                                            f"Codex computer_use_preview exceeded computer_loop_max_steps={self.computer_loop_max_steps}"
+                                        )
+                                    for computer_call in parsed.computer_calls:
+                                        signature = self._computer_call_signature(computer_call)
+                                        if signature in recent_computer_signatures:
+                                            raise RuntimeError(
+                                                "Codex computer_use_preview detected repeated computer call without new output"
+                                            )
+                                        recent_computer_signatures.add(signature)
+                                    computer_output_items, handled_computer_batch = await self._execute_computer_calls(parsed.computer_calls)
+                                    handled_computer_calls.extend(handled_computer_batch)
+                                    if emit_structured_events:
+                                        for item in computer_output_items:
+                                            yield ChatGenerationChunk(
+                                                message=AIMessageChunk(
+                                                    content="",
+                                                    additional_kwargs={
+                                                        "codex_event": {
+                                                            "type": "response.computer_call_output",
+                                                            "item": item,
+                                                        }
+                                                    },
+                                                )
+                                            )
+                                    callback = getattr(run_manager, "on_custom_event", None)
+                                    if callable(callback):
+                                        maybe_result = callback(
+                                            "codex.responses.computer_call_output",
+                                            {"items": computer_output_items, "handled_computer_calls": handled_computer_batch},
+                                        )
+                                        if asyncio.iscoroutine(maybe_result):
+                                            await maybe_result
+                                    follow_up_items.extend(computer_output_items)
+                                if self.auto_execute_tools and parsed.external_tool_calls:
+                                    for tool_call in parsed.external_tool_calls:
+                                        signature = self._tool_call_signature(tool_call)
+                                        if signature in recent_tool_signatures:
+                                            raise RuntimeError(
+                                                f"Codex auto_execute_tools detected repeated tool call without assistant progress: {tool_call['name']}"
+                                            )
+                                        recent_tool_signatures.add(signature)
+                                    tool_output_items, handled_batch = await self._execute_bound_tool_calls(parsed.external_tool_calls)
+                                    handled_tool_calls.extend(handled_batch)
+                                    if emit_structured_events:
+                                        for item in tool_output_items:
+                                            yield ChatGenerationChunk(
+                                                message=AIMessageChunk(
+                                                    content="",
+                                                    additional_kwargs={
+                                                        "codex_event": {
+                                                            "type": "response.function_call_output",
+                                                            "item": item,
+                                                        }
+                                                    },
+                                                )
+                                            )
+                                    callback = getattr(run_manager, "on_custom_event", None)
+                                    if callable(callback):
+                                        maybe_result = callback(
+                                            "codex.responses.function_call_output",
+                                            {"items": tool_output_items, "handled_tool_calls": handled_batch},
+                                        )
+                                        if asyncio.iscoroutine(maybe_result):
+                                            await maybe_result
+                                    follow_up_items.extend(tool_output_items)
+                                if follow_up_items:
+                                    input_items.extend(parsed.raw_output_items)
+                                    input_items.extend(follow_up_items)
+                                    continue_tool_loop = True
+                                    break
+                            return
+                        if saw_done:
+                            raise RuntimeError("Codex API stream ended with [DONE] but no final response payload")
+                        if request_saw_delta:
+                            _LOGGER.warning("Codex stream ended without [DONE]; returning partial response")
+                            return
+                        raise RuntimeError("Codex API stream ended unexpectedly before completion event")
+                else:
+                    raise RuntimeError("Codex API error: unauthorized after token refresh")
+                if continue_tool_loop:
+                    continue
+                return
+            raise RuntimeError(f"Codex auto_execute_tools exceeded max_tool_rounds={self.max_tool_rounds}")
