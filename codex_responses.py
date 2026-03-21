@@ -48,11 +48,22 @@ def parse_arguments(arguments: Any) -> Any:
 def serialize_function_call_output(value: Any) -> Any:
     if isinstance(value, str):
         return value
-    if isinstance(value, dict):
-        return _json_safe_copy(value)
     if isinstance(value, list) and all(isinstance(item, dict) for item in value):
         return [_json_safe_copy(item) for item in value]
     return json.dumps(value, default=str)
+
+
+def normalize_followup_input_items(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        item = _json_safe_copy(raw_item)
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"function_call_output", "custom_tool_call_output"} and "output" in item:
+            item["output"] = serialize_function_call_output(item.get("output"))
+        normalized.append(item)
+    return normalized
 
 
 def normalize_responses_message_content(content: Any) -> Any:

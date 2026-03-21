@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import logging
+import uuid
 from typing import Any, AsyncIterator, Callable, Sequence
 
 import httpx
@@ -35,6 +36,7 @@ from .codex_responses import (
     latest_code_interpreter_container_id,
     latest_response_id,
     message_additional_input_items,
+    normalize_followup_input_items,
     normalize_responses_message_content,
     normalize_responses_input_items,
     parse_responses_output,
@@ -177,6 +179,9 @@ class ChatCodex(BaseChatModel):
 
     account_id: str | None = Field(default=None)
     """Optional ChatGPT account ID override."""
+
+    session_id: str | None = Field(default=None, exclude=True)
+    """Optional ChatGPT Codex session/thread id used via request headers."""
 
     extra_body: dict[str, Any] | None = Field(default=None, exclude=True)
     """Additional Responses API request fields to merge in."""
@@ -703,6 +708,25 @@ class ChatCodex(BaseChatModel):
         configured = str(self.previous_response_id or "").strip()
         return configured or None
 
+    def _resolve_session_id(self, explicit_session_id: str | None = None) -> str:
+        if explicit_session_id is not None:
+            value = str(explicit_session_id or "").strip()
+            if value:
+                self.session_id = value
+                return value
+        configured = str(self.session_id or "").strip()
+        if configured:
+            return configured
+        generated = str(uuid.uuid4())
+        self.session_id = generated
+        return generated
+
+    def _apply_session_headers(self, headers: dict[str, str], session_id: str) -> None:
+        if not session_id:
+            return
+        headers["session_id"] = session_id
+        headers["x-client-request-id"] = session_id
+
     def _resolve_request_tools(self, messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
         tools = [dict(tool) for tool in [*self._tools, *self._native_tools]]
         if not self._reuse_previous_code_interpreter_container:
@@ -975,8 +999,12 @@ class ChatCodex(BaseChatModel):
                     })
                 input_items.extend(message_additional_input_items(msg))
 
-        input_items.extend(dict(item) for item in self._default_input_items)
-        return normalize_responses_input_items(input_items)
+        normalized_items = normalize_responses_input_items(input_items)
+        # `with_input_items(...)` is the exact-input escape hatch used by the
+        # Responses proxy. Preserve those items verbatim so follow-up payloads
+        # such as standalone `function_call_output` entries are not dropped.
+        normalized_items.extend(normalize_followup_input_items(self._default_input_items))
+        return normalized_items
 
     def _build_request_body(
         self,
@@ -1025,9 +1053,8 @@ class ChatCodex(BaseChatModel):
         elif self._should_apply_default_reasoning(effective_model):
             body["reasoning"] = {"effort": "medium", "summary": "auto"}
 
-        metadata_payload = metadata if metadata is not None else self.metadata
-        if metadata_payload is not None:
-            body["metadata"] = metadata_payload
+        # Codex API does not support the metadata parameter
+        # so we ignore metadata_payload to prevent 400 errors.
         include_payload = include if include is not None else self.include
         if include_payload is not None:
             body["include"] = include_payload
@@ -1042,11 +1069,10 @@ class ChatCodex(BaseChatModel):
         )
         if parallel_tool_calls_payload is not None:
             body["parallel_tool_calls"] = parallel_tool_calls_payload
-        previous_response_id_payload = (
-            previous_response_id if previous_response_id is not None else self.previous_response_id
-        )
-        if previous_response_id_payload is not None:
-            body["previous_response_id"] = previous_response_id_payload
+        # ChatGPT Codex thread continuity is anchored by request headers (`session_id`),
+        # not a `previous_response_id` field in the JSON body. We still accept the
+        # parameter at the model boundary for compatibility and metadata bookkeeping.
+        _ = previous_response_id
 
         request_tools = [dict(tool) for tool in tools] if tools is not None else [*self._tools, *self._native_tools]
         if request_tools:
@@ -1153,6 +1179,7 @@ class ChatCodex(BaseChatModel):
             messages,
             explicit_previous_response_id=kwargs.get("previous_response_id"),
         )
+        request_session_id = self._resolve_session_id(kwargs.get("session_id"))
         resolved_tools = self._resolve_request_tools(messages)
         effective_model = normalize_codex_model(self.model)
         instructions = get_codex_instructions(effective_model)
@@ -1177,6 +1204,7 @@ class ChatCodex(BaseChatModel):
 
         if auth.account_id:
             headers["chatgpt-account-id"] = auth.account_id
+        self._apply_session_headers(headers, request_session_id)
 
         # IMPORTANT: Codex uses /codex/responses (not /responses).
         url = f"{CODEX_BASE_URL}/codex/responses"
@@ -1321,6 +1349,7 @@ class ChatCodex(BaseChatModel):
             messages,
             explicit_previous_response_id=kwargs.get("previous_response_id"),
         )
+        request_session_id = self._resolve_session_id(kwargs.get("session_id"))
         resolved_tools = self._resolve_request_tools(messages)
         effective_model = normalize_codex_model(self.model)
         instructions = get_codex_instructions(effective_model)
@@ -1345,6 +1374,7 @@ class ChatCodex(BaseChatModel):
 
         if auth.account_id:
             headers["chatgpt-account-id"] = auth.account_id
+        self._apply_session_headers(headers, request_session_id)
 
         url = f"{CODEX_BASE_URL}/codex/responses"
 
@@ -1475,6 +1505,18 @@ class ChatCodex(BaseChatModel):
                                     continue
                         final_response = accumulator.build_response()
                         if final_response:
+                            if emit_structured_events:
+                                yield ChatGenerationChunk(
+                                    message=AIMessageChunk(
+                                        content="",
+                                        additional_kwargs={
+                                            "codex_event": {
+                                                "type": "response.completed",
+                                                "response": final_response,
+                                            }
+                                        },
+                                    )
+                                )
                             callback = getattr(run_manager, "on_custom_event", None)
                             if callable(callback):
                                 maybe_result = callback(
