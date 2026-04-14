@@ -13,6 +13,10 @@ from langchain_core.messages import (
 )
 
 
+def _record(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def convert_content(content: str | list[Any]) -> list[dict[str, Any]]:
     """Convert message content to parts."""
     if isinstance(content, str):
@@ -27,7 +31,8 @@ def convert_content(content: str | list[Any]) -> list[dict[str, Any]]:
                 parts.append({"text": item.get("text", "")})
             elif item.get("type") == "image_url":
                 # Handle image content
-                url = item.get("image_url", {}).get("url", "")
+                image_url = _record(item.get("image_url"))
+                url = image_url.get("url", "")
                 if url.startswith("data:"):
                     # Base64 image
                     mime_type = url.split(";")[0].split(":")[1]

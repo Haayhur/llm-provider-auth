@@ -81,6 +81,10 @@ async def _read_response_text(response: httpx.Response) -> str:
         return ""
 
 
+def _record(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 class ChatAntigravity(BaseChatModel):
     """
     LangChain ChatModel for Antigravity API.
@@ -249,24 +253,26 @@ class ChatAntigravity(BaseChatModel):
     def _parse_response(self, response_data: dict[str, Any]) -> AIMessage:
         """Parse Antigravity response into AIMessage."""
         # Unwrap response envelope
-        inner = response_data.get("response", response_data)
+        inner = _record(response_data.get("response")) or response_data
         
         candidates = inner.get("candidates", [])
         if not candidates:
             return AIMessage(content="")
         
-        candidate = candidates[0]
-        content_obj = candidate.get("content", {})
+        candidate = _record(candidates[0])
+        content_obj = _record(candidate.get("content"))
         parts = content_obj.get("parts", [])
         
         text_parts = []
         tool_calls = []
         
         for part in parts:
+            if not isinstance(part, dict):
+                continue
             if "text" in part and not part.get("thought"):
                 text_parts.append(part["text"])
             elif "functionCall" in part:
-                fc = part["functionCall"]
+                fc = _record(part["functionCall"])
                 tool_calls.append(
                     ToolCall(
                         name=fc.get("name", ""),
@@ -284,7 +290,7 @@ class ChatAntigravity(BaseChatModel):
             content=content,
             tool_calls=tool_calls if tool_calls else [],
             usage_metadata=usage_metadata or None,
-            response_metadata=response_metadata or None,
+            response_metadata=response_metadata,
         )
     
     async def _agenerate(
@@ -487,12 +493,15 @@ class ChatAntigravity(BaseChatModel):
 
                                         try:
                                             chunk_data = json.loads(data)
-                                            inner = chunk_data.get("response", chunk_data)
+                                            inner = _record(chunk_data.get("response")) or chunk_data
                                             candidates = inner.get("candidates", [])
 
                                             if candidates:
-                                                parts = candidates[0].get("content", {}).get("parts", [])
+                                                candidate = _record(candidates[0])
+                                                parts = _record(candidate.get("content")).get("parts", [])
                                                 for part in parts:
+                                                    if not isinstance(part, dict):
+                                                        continue
                                                     if "text" in part and not part.get("thought"):
                                                         yield ChatGenerationChunk(
                                                             message=AIMessageChunk(content=part["text"])
