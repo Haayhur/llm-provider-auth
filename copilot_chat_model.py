@@ -13,6 +13,7 @@ import os
 import shutil
 from typing import Any, AsyncIterator, Callable, Sequence
 
+import httpx
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -24,25 +25,42 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolCall,
     ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 try:
     from .copilot_auth import CopilotAuth, load_copilot_auth_from_storage
+    from .copilot_models import _copilot_api_base
 except Exception:  # pragma: no cover
     from copilot_auth import CopilotAuth, load_copilot_auth_from_storage  # type: ignore
+    from copilot_models import _copilot_api_base  # type: ignore
 
 
 try:
     from copilot import CopilotClient, Tool, ToolResult, SessionEvent  # type: ignore
     from copilot.generated.session_events import SessionEventType  # type: ignore
-except Exception as exc:  # pragma: no cover
-    raise ImportError(
-        "github-copilot-sdk is required for Copilot provider. "
-        "Install it with `pip install github-copilot-sdk`."
-    ) from exc
+except Exception:  # pragma: no cover
+    CopilotClient = None  # type: ignore[assignment]
+    SessionEvent = Any  # type: ignore[misc, assignment]
+    SessionEventType = None  # type: ignore[assignment]
+    ToolResult = dict[str, Any]  # type: ignore[misc, assignment]
+
+    class Tool:  # type: ignore[no-redef]
+        def __init__(
+            self,
+            *,
+            name: str,
+            description: str = "",
+            handler: Callable[..., Any] | None = None,
+            parameters: dict[str, Any] | None = None,
+        ) -> None:
+            self.name = name
+            self.description = description
+            self.handler = handler
+            self.parameters = parameters or {}
 
 
 def _patch_copilot_context_parsing() -> None:
@@ -106,6 +124,88 @@ def _coerce_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _message_has_image(value: Any) -> bool:
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in {"image_url", "input_image", "image"}:
+                return True
+            if item_type == "tool_result" and _message_has_image(item.get("content")):
+                return True
+    return False
+
+
+def _normalize_content_parts(value: Any, *, anthropic: bool = False) -> str | list[dict[str, Any]]:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return _coerce_text(value)
+
+    parts: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            text = _coerce_text(item)
+            if text:
+                parts.append({"type": "text", "text": text})
+            continue
+        item_type = item.get("type")
+        if item_type in {"text", "input_text"}:
+            text = item.get("text") or item.get("content")
+            if text:
+                parts.append({"type": "text", "text": str(text)})
+            continue
+        if item_type in {"image_url", "input_image", "image"}:
+            if anthropic:
+                source = item.get("source")
+                if isinstance(source, dict):
+                    parts.append({"type": "image", "source": source})
+                    continue
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url")
+                else:
+                    url = image_url or item.get("url")
+                if isinstance(url, str) and url.startswith("data:"):
+                    media_type, _, data = url.partition(",")
+                    media_type = media_type.removeprefix("data:").split(";", 1)[0] or "image/png"
+                    parts.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+                elif isinstance(url, str):
+                    parts.append({"type": "image", "source": {"type": "url", "url": url}})
+                continue
+            if item_type == "image_url":
+                parts.append(dict(item))
+                continue
+            image_url = item.get("image_url") or item.get("url")
+            if image_url:
+                parts.append({"type": "image_url", "image_url": image_url if isinstance(image_url, dict) else {"url": image_url}})
+            continue
+    if not parts:
+        return ""
+    return parts
+
+
+def _is_anthropic_messages_model(model: str) -> bool:
+    model_id = (model or "").strip().lower()
+    return model_id.startswith("claude-")
+
+
+def _resolve_initiator(messages: Sequence[BaseMessage], configured: str | None) -> str:
+    value = (configured or "").strip().lower()
+    if value in {"user", "agent"}:
+        return value
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return "user"
+        if isinstance(msg, (AIMessage, ToolMessage, SystemMessage)):
+            return "agent"
+    return "user"
 
 
 def _normalize_tool_result(result: Any) -> ToolResult:
@@ -227,8 +327,16 @@ class ChatCopilot(BaseChatModel):
     use_stdio: bool | None = Field(default=None)
     log_level: str | None = Field(default=None)
     session_timeout: float | None = Field(default=None, exclude=True)
+    transport: str = Field(default="direct")
+    api_base: str | None = Field(default=None)
+    request_timeout: float = Field(default=120.0)
+    initiator: str = Field(default="auto")
+    max_tokens: int | None = Field(default=None)
+    reasoning_effort: str | None = Field(default=None)
 
-    _tools: list[Tool] = []
+    _tools: list[Tool] = PrivateAttr(default_factory=list)
+    _openai_tools: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _anthropic_tools: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -251,13 +359,35 @@ class ChatCopilot(BaseChatModel):
             return new_model
 
         copilot_tools: list[Tool] = []
+        openai_tools: list[dict[str, Any]] = []
+        anthropic_tools: list[dict[str, Any]] = []
         for tool in tools:
             built = _build_tool(tool)
             if built:
                 copilot_tools.append(built)
+                schema = getattr(built, "parameters", None) or {}
+                openai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": getattr(built, "name", ""),
+                            "description": getattr(built, "description", "") or "",
+                            "parameters": schema,
+                        },
+                    }
+                )
+                anthropic_tools.append(
+                    {
+                        "name": getattr(built, "name", ""),
+                        "description": getattr(built, "description", "") or "",
+                        "input_schema": schema or {"type": "object", "properties": {}},
+                    }
+                )
 
         new_model = self.model_copy()
         new_model._tools = copilot_tools
+        new_model._openai_tools = openai_tools
+        new_model._anthropic_tools = anthropic_tools
         return new_model
 
     async def _ensure_auth(self) -> CopilotAuth | None:
@@ -291,6 +421,11 @@ class ChatCopilot(BaseChatModel):
         return prompt, system_message
 
     def _build_client(self, auth: CopilotAuth | None) -> CopilotClient:
+        if CopilotClient is None:
+            raise ImportError(
+                "github-copilot-sdk is required for ChatCopilot transport='sdk'. "
+                "Use transport='direct' or install github-copilot-sdk."
+            )
         cli_url = self.cli_url or os.environ.get("COPILOT_CLI_URL")
         cli_path = _resolve_cli_path(self.cli_path or os.environ.get("COPILOT_CLI_PATH"))
 
@@ -323,6 +458,193 @@ class ChatCopilot(BaseChatModel):
 
         return CopilotClient(options)
 
+    def _direct_base_url(self, auth: CopilotAuth | None) -> str:
+        return (self.api_base or _copilot_api_base(auth.enterprise_url if auth else None)).rstrip("/")
+
+    def _direct_headers(self, auth: CopilotAuth, messages: Sequence[BaseMessage]) -> dict[str, str]:
+        if not auth.access_token:
+            raise ValueError("Missing GitHub access token for Copilot")
+        headers = {
+            "Authorization": f"Bearer {auth.access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "langchain-antigravity/copilot",
+            "Openai-Intent": "conversation-edits",
+            "x-initiator": _resolve_initiator(messages, self.initiator),
+        }
+        if any(_message_has_image(getattr(msg, "content", None)) for msg in messages):
+            headers["Copilot-Vision-Request"] = "true"
+        return headers
+
+    def _convert_openai_messages(self, messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                role = "system"
+            elif isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, AIMessage):
+                role = "assistant"
+            elif isinstance(msg, ToolMessage):
+                converted.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(getattr(msg, "tool_call_id", "") or ""),
+                        "content": _coerce_text(msg.content),
+                    }
+                )
+                continue
+            else:
+                role = "user"
+            item: dict[str, Any] = {"role": role, "content": _normalize_content_parts(msg.content)}
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                tool_calls = []
+                for call in msg.tool_calls:
+                    tool_calls.append(
+                        {
+                            "id": call.get("id") or call.get("call_id"),
+                            "type": "function",
+                            "function": {
+                                "name": call.get("name"),
+                                "arguments": json.dumps(call.get("args") or {}, default=str),
+                            },
+                        }
+                    )
+                item["tool_calls"] = tool_calls
+            converted.append(item)
+        return converted
+
+    def _convert_anthropic_messages(self, messages: Sequence[BaseMessage]) -> tuple[str | None, list[dict[str, Any]]]:
+        system_parts: list[str] = []
+        converted: list[dict[str, Any]] = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                text = _coerce_text(msg.content)
+                if text:
+                    system_parts.append(text)
+                continue
+            if isinstance(msg, HumanMessage):
+                converted.append({"role": "user", "content": _normalize_content_parts(msg.content, anthropic=True)})
+            elif isinstance(msg, AIMessage):
+                converted.append({"role": "assistant", "content": _normalize_content_parts(msg.content, anthropic=True)})
+            elif isinstance(msg, ToolMessage):
+                converted.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": str(getattr(msg, "tool_call_id", "") or ""),
+                                "content": _coerce_text(msg.content),
+                            }
+                        ],
+                    }
+                )
+        return ("\n\n".join(system_parts).strip() or None), converted
+
+    def _parse_openai_message(self, payload: dict[str, Any]) -> AIMessage:
+        choice = (payload.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        tool_calls: list[ToolCall] = []
+        for raw_call in message.get("tool_calls") or []:
+            if not isinstance(raw_call, dict):
+                continue
+            function = raw_call.get("function") or {}
+            args_raw = function.get("arguments") or "{}"
+            try:
+                args = json.loads(args_raw) if isinstance(args_raw, str) else {}
+            except Exception:
+                args = {}
+            tool_calls.append(
+                ToolCall(
+                    name=str(function.get("name") or ""),
+                    args=args,
+                    id=str(raw_call.get("id") or ""),
+                )
+            )
+        metadata: dict[str, Any] = {}
+        if message.get("reasoning_text"):
+            metadata["reasoning"] = message.get("reasoning_text")
+        if message.get("reasoning_opaque"):
+            metadata["copilot_reasoning_opaque"] = message.get("reasoning_opaque")
+        if payload.get("usage"):
+            metadata["usage"] = payload.get("usage")
+        return AIMessage(content=content, tool_calls=tool_calls, response_metadata=metadata or None)
+
+    def _parse_anthropic_message(self, payload: dict[str, Any]) -> AIMessage:
+        content_parts = payload.get("content") if isinstance(payload, dict) else None
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        metadata: dict[str, Any] = {}
+        if isinstance(content_parts, list):
+            for part in content_parts:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "text" and isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+                elif part_type in {"thinking", "reasoning"} and isinstance(part.get("thinking") or part.get("text"), str):
+                    metadata["reasoning"] = part.get("thinking") or part.get("text")
+                elif part_type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(
+                            name=str(part.get("name") or ""),
+                            args=part.get("input") if isinstance(part.get("input"), dict) else {},
+                            id=str(part.get("id") or ""),
+                        )
+                    )
+        if payload.get("usage"):
+            metadata["usage"] = payload.get("usage")
+        kwargs: dict[str, Any] = {"content": "\n".join(text_parts), "tool_calls": tool_calls}
+        if metadata:
+            kwargs["response_metadata"] = metadata
+        return AIMessage(**kwargs)
+
+    async def _direct_agenerate(self, messages: list[BaseMessage]) -> ChatResult:
+        auth = await self._ensure_auth()
+        if auth is None:
+            raise ValueError("No Copilot authentication found. Run 'copilot-auth login' first or provide auth.")
+        base_url = self._direct_base_url(auth)
+        headers = self._direct_headers(auth, messages)
+        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+            if _is_anthropic_messages_model(self.model):
+                system_message, anthropic_messages = self._convert_anthropic_messages(messages)
+                body: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": anthropic_messages,
+                    "max_tokens": self.max_tokens or 4096,
+                }
+                if system_message:
+                    body["system"] = system_message
+                if self.temperature is not None:
+                    body["temperature"] = self.temperature
+                if self._anthropic_tools:
+                    body["tools"] = self._anthropic_tools
+                response = await client.post(f"{base_url}/v1/messages", headers={**headers, "anthropic-beta": "interleaved-thinking-2025-05-14"}, json=body)
+                if not response.is_success:
+                    raise RuntimeError(f"Copilot API error: {response.status_code} - {response.text}")
+                message = self._parse_anthropic_message(response.json())
+            else:
+                body = {
+                    "model": self.model,
+                    "messages": self._convert_openai_messages(messages),
+                }
+                if self.temperature is not None:
+                    body["temperature"] = self.temperature
+                if self.max_tokens is not None:
+                    body["max_tokens"] = self.max_tokens
+                if self.reasoning_effort is not None:
+                    body["reasoning_effort"] = self.reasoning_effort
+                if self._openai_tools:
+                    body["tools"] = self._openai_tools
+                response = await client.post(f"{base_url}/chat/completions", headers=headers, json=body)
+                if not response.is_success:
+                    raise RuntimeError(f"Copilot API error: {response.status_code} - {response.text}")
+                message = self._parse_openai_message(response.json())
+        llm_output = {"model_name": self.model, "transport": "direct"}
+        return ChatResult(generations=[ChatGeneration(message=message)], llm_output=llm_output)
+
     async def _agenerate(
         self,
         messages: list[BaseMessage],
@@ -330,6 +652,9 @@ class ChatCopilot(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        if (self.transport or "direct").strip().lower() == "direct":
+            return await self._direct_agenerate(messages)
+
         auth = await self._ensure_auth()
         prompt, system_message = self._build_prompt(messages)
 
@@ -390,6 +715,14 @@ class ChatCopilot(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        if (self.transport or "direct").strip().lower() == "direct":
+            result = await self._direct_agenerate(messages)
+            message = result.generations[0].message
+            content = _coerce_text(message.content)
+            if content:
+                yield ChatGenerationChunk(message=AIMessageChunk(content=content))
+            return
+
         auth = await self._ensure_auth()
         prompt, system_message = self._build_prompt(messages)
 
