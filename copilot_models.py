@@ -9,6 +9,8 @@ import re
 import shutil
 from typing import Any
 
+import httpx
+
 try:
     from .copilot_auth import CopilotAuth
 except Exception:  # pragma: no cover
@@ -36,6 +38,88 @@ DEFAULT_COPILOT_MODELS = [
     {"id": "gpt-5.2-codex", "name": "GPT-5.2-Codex", "description": "GPT-5.2-Codex via Copilot"},
     {"id": "grok-code-fast-1", "name": "Grok Code Fast 1", "description": "Grok Code Fast 1 via Copilot"},
 ]
+
+
+def _normalize_domain(value: str | None) -> str:
+    if not value:
+        return ""
+    cleaned = str(value).strip()
+    if cleaned.startswith("http://"):
+        cleaned = cleaned[len("http://") :]
+    if cleaned.startswith("https://"):
+        cleaned = cleaned[len("https://") :]
+    cleaned = cleaned.split("/", 1)[0]
+    return cleaned.rstrip("/")
+
+
+def _copilot_api_base(enterprise_url: str | None) -> str:
+    domain = _normalize_domain(enterprise_url)
+    if domain and domain != "github.com":
+        return f"https://copilot-api.{domain}"
+    return "https://api.githubcopilot.com"
+
+
+def _remote_model_name(model_id: str, payload: dict[str, Any]) -> str:
+    name = payload.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return model_id_to_name(model_id)
+
+
+def _remote_model_description(model_id: str, payload: dict[str, Any]) -> str:
+    family = payload.get("capabilities", {}).get("family") if isinstance(payload.get("capabilities"), dict) else None
+    if isinstance(family, str) and family.strip():
+        return f"{_remote_model_name(model_id, payload)} via Copilot ({family.strip()})"
+    return f"{_remote_model_name(model_id, payload)} via Copilot"
+
+
+async def fetch_copilot_api_models(
+    auth: CopilotAuth | None,
+    *,
+    timeout: float = 5.0,
+) -> list[dict[str, str]]:
+    if not auth or not auth.access_token:
+        return []
+    if auth.is_expired():
+        return []
+
+    base_url = _copilot_api_base(auth.enterprise_url)
+    headers = {
+        "Authorization": f"Bearer {auth.access_token}",
+        "Accept": "application/json",
+        "User-Agent": "co-scientist/copilot",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(f"{base_url}/models", headers=headers)
+    if not response.is_success:
+        raise ValueError(f"Failed to fetch Copilot models: {response.status_code}")
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if item.get("model_picker_enabled") is False:
+            continue
+        policy = item.get("policy")
+        if isinstance(policy, dict) and policy.get("state") == "disabled":
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append(
+            {
+                "id": model_id,
+                "name": _remote_model_name(model_id, item),
+                "description": _remote_model_description(model_id, item),
+            }
+        )
+    return models
 
 _MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]+")
 _MODEL_STOPWORDS = {"model", "models", "available", "current", "default"}

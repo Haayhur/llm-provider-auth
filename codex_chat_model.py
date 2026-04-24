@@ -84,7 +84,7 @@ _AUTH_METRICS: dict[str, int] = {
     "codex_unauthorized_retry_success": 0,
     "codex_unauthorized_retry_fail": 0,
 }
-_CODEX_OAUTH_ALLOWED_NON_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.2", "gpt-5.4"})
+_CODEX_OAUTH_ALLOWED_NON_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.2", "gpt-5.4", "gpt-5.4-mini"})
 
 
 def _record_auth_metric(metric: str, **context: str | None) -> None:

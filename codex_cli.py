@@ -14,6 +14,7 @@ import asyncio
 import sys
 
 from .codex_auth import (
+    codex_device_login,
     codex_interactive_login,
     load_codex_auth_from_storage,
     list_codex_accounts,
@@ -27,7 +28,10 @@ from .codex_auth import (
 def cmd_login(args):
     """Login with ChatGPT/OpenAI account."""
     async def do_login():
-        await codex_interactive_login()
+        if args.device:
+            await codex_device_login()
+        else:
+            await codex_interactive_login()
 
     try:
         asyncio.run(do_login())
@@ -116,6 +120,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     login_parser = subparsers.add_parser("login", help="Authenticate with ChatGPT/OpenAI account")
+    login_parser.add_argument("--device", action="store_true", help="Use the headless device-code flow")
     login_parser.set_defaults(func=cmd_login)
 
     logout_parser = subparsers.add_parser("logout", help="Remove an account")

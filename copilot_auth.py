@@ -135,6 +135,10 @@ def _is_enterprise_domain(domain: str) -> bool:
     return bool(domain) and domain != "github.com"
 
 
+def _copilot_provider_id() -> str:
+    return "copilot"
+
+
 def _resolve_github_api_base(domain: str) -> str:
     if not domain or domain == "github.com":
         return constants.COPILOT_API_BASE
@@ -198,7 +202,7 @@ async def request_copilot_device_code(
         "verification_uri": verification_uri,
         "interval": interval,
         "domain": domain,
-        "provider": "github-copilot-enterprise" if _is_enterprise_domain(domain) else "github-copilot",
+        "provider": _copilot_provider_id(),
         "enterprise_url": domain if _is_enterprise_domain(domain) else None,
     }
 
@@ -282,7 +286,6 @@ async def copilot_auth_from_pat(
     email = profile.get("email") if isinstance(profile.get("email"), str) else None
     if not account_id:
         account_id = login or email or _pat_account_id(token)
-    provider = "github-copilot-enterprise" if _is_enterprise_domain(domain_value) else "github-copilot"
     enterprise_value = domain_value if _is_enterprise_domain(domain_value) else None
     return CopilotAuth(
         access_token=token,
@@ -290,7 +293,7 @@ async def copilot_auth_from_pat(
         account_id=account_id,
         login=login,
         email=email,
-        provider=provider,
+        provider=_copilot_provider_id(),
         enterprise_url=enterprise_value,
     )
 
@@ -353,7 +356,6 @@ async def exchange_copilot_device_code(
                 email = profile.get("email") if isinstance(profile.get("email"), str) else None
                 if not account_id:
                     account_id = login or email
-                provider = "github-copilot-enterprise" if _is_enterprise_domain(domain_value) else "github-copilot"
                 enterprise_value = domain_value if _is_enterprise_domain(domain_value) else None
                 return CopilotAuth(
                     access_token=access_token,
@@ -361,7 +363,7 @@ async def exchange_copilot_device_code(
                     account_id=account_id,
                     login=login,
                     email=email,
-                    provider=provider,
+                    provider=_copilot_provider_id(),
                     enterprise_url=enterprise_value,
                 )
 

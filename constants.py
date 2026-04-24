@@ -175,7 +175,7 @@ CODEX_DUMMY_API_KEY = "chatgpt-oauth"
 
 CODEX_HEADERS = {
     "OpenAI-Beta": "responses=experimental",
-    "originator": "codex_cli_rs",
+    "originator": "opencode",
 }
 
 # ChatGPT Codex backend requires an `instructions` string in the request body.
@@ -184,6 +184,17 @@ CODEX_HEADERS = {
 CODEX_DEFAULT_INSTRUCTIONS = "You are Codex, a helpful coding assistant."
 
 CODEX_MODEL_MAPPINGS = {
+    "gpt-5.4": "gpt-5.4",
+    "gpt-5.4-none": "gpt-5.4",
+    "gpt-5.4-low": "gpt-5.4",
+    "gpt-5.4-medium": "gpt-5.4",
+    "gpt-5.4-high": "gpt-5.4",
+    "gpt-5.4-xhigh": "gpt-5.4",
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.4-mini-low": "gpt-5.4-mini",
+    "gpt-5.4-mini-medium": "gpt-5.4-mini",
+    "gpt-5.4-mini-high": "gpt-5.4-mini",
+    "gpt-5.4-mini-xhigh": "gpt-5.4-mini",
     "gpt-5.2": "gpt-5.2",
     "gpt-5.2-none": "gpt-5.2",
     "gpt-5.2-low": "gpt-5.2",

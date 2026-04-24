@@ -5,6 +5,7 @@ Based on opencode-openai-codex-auth by Numman Ali:
 https://github.com/numman-ali/opencode-openai-codex-auth
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -270,17 +271,33 @@ def decode_jwt(token: str) -> dict[str, Any] | None:
 
 
 def extract_account_id(access_token: str) -> str | None:
-    """Extract ChatGPT account ID from JWT access token."""
+    """Extract ChatGPT account ID from a JWT token."""
     try:
         payload = decode_jwt(access_token)
         if not payload:
             return None
 
+        direct = payload.get("chatgpt_account_id")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
         claim_path = "https://api.openai.com/auth"
         auth_data = payload.get(claim_path, {})
-        return auth_data.get("chatgpt_account_id")
+        if isinstance(auth_data, dict):
+            account_id = auth_data.get("chatgpt_account_id")
+            if isinstance(account_id, str) and account_id.strip():
+                return account_id.strip()
+
+        organizations = payload.get("organizations")
+        if isinstance(organizations, list) and organizations:
+            first = organizations[0]
+            if isinstance(first, dict):
+                org_id = first.get("id")
+                if isinstance(org_id, str) and org_id.strip():
+                    return org_id.strip()
     except Exception:
         return None
+    return None
 
 
 def extract_account_email(access_token: str) -> str | None:
@@ -315,6 +332,30 @@ def extract_account_email(access_token: str) -> str | None:
     return None
 
 
+def _extract_account_id_from_token_data(token_data: dict[str, Any]) -> str | None:
+    id_token = token_data.get("id_token")
+    if isinstance(id_token, str) and id_token.strip():
+        account_id = extract_account_id(id_token)
+        if account_id:
+            return account_id
+    access_token = token_data.get("access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        return extract_account_id(access_token)
+    return None
+
+
+def _extract_email_from_token_data(token_data: dict[str, Any]) -> str | None:
+    id_token = token_data.get("id_token")
+    if isinstance(id_token, str) and id_token.strip():
+        email = extract_account_email(id_token)
+        if email:
+            return email
+    access_token = token_data.get("access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        return extract_account_email(access_token)
+    return None
+
+
 def authorize_codex() -> tuple[str, str, str]:
     """Generate authorization URL and state for Codex OAuth flow."""
     verifier, challenge = generate_pkce()
@@ -331,7 +372,7 @@ def authorize_codex() -> tuple[str, str, str]:
         "state": state,
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
-        "originator": "codex_cli_rs",
+        "originator": "opencode",
     }
 
     url = f"{constants.CODEX_AUTHORIZE_URL}?{urlencode(params)}"
@@ -370,8 +411,8 @@ async def exchange_codex_token(
         if not access_token or not refresh_token:
             raise ValueError("Missing required tokens in response")
 
-        account_id = extract_account_id(access_token)
-        email = extract_account_email(access_token)
+        account_id = _extract_account_id_from_token_data(token_data)
+        email = _extract_email_from_token_data(token_data)
 
         return CodexAuth(
             access_token=access_token,
@@ -380,6 +421,91 @@ async def exchange_codex_token(
             account_id=account_id,
             email=email,
         )
+
+
+def _codex_issuer() -> str:
+    parsed = urlparse(constants.CODEX_AUTHORIZE_URL)
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://auth.openai.com"
+
+
+async def request_codex_device_code() -> dict[str, Any]:
+    """Start OpenAI's headless Codex device-code flow."""
+    issuer = _codex_issuer()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{issuer}/api/accounts/deviceauth/usercode",
+            json={"client_id": constants.CODEX_CLIENT_ID},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "opencode",
+            },
+        )
+    if not response.is_success:
+        raise ValueError(f"Failed to initiate device authorization: {response.text}")
+
+    payload = response.json()
+    device_auth_id = payload.get("device_auth_id")
+    user_code = payload.get("user_code")
+    if not device_auth_id or not user_code:
+        raise ValueError("Invalid device authorization response")
+
+    try:
+        interval = max(int(payload.get("interval") or 5), 1)
+    except Exception:
+        interval = 5
+
+    return {
+        "device_auth_id": device_auth_id,
+        "user_code": user_code,
+        "verification_uri": f"{issuer}/codex/device",
+        "interval": interval,
+        "issuer": issuer,
+    }
+
+
+async def exchange_codex_device_code(
+    device_auth_id: str,
+    user_code: str,
+    *,
+    interval: int = 5,
+    timeout_seconds: int = 300,
+) -> CodexAuth:
+    """Poll OpenAI's device-code flow and exchange the issued authorization code."""
+    if not device_auth_id or not user_code:
+        raise ValueError("Missing device authorization data")
+
+    issuer = _codex_issuer()
+    deadline = time.time() + max(timeout_seconds, 1)
+    poll_interval = max(int(interval or 5), 1)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while time.time() < deadline:
+            response = await client.post(
+                f"{issuer}/api/accounts/deviceauth/token",
+                json={"device_auth_id": device_auth_id, "user_code": user_code},
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "opencode",
+                },
+            )
+            if response.is_success:
+                payload = response.json()
+                authorization_code = payload.get("authorization_code")
+                code_verifier = payload.get("code_verifier")
+                if not authorization_code or not code_verifier:
+                    raise ValueError("Invalid device token response")
+                return await exchange_codex_token(
+                    authorization_code,
+                    code_verifier,
+                    redirect_uri=f"{issuer}/deviceauth/callback",
+                )
+
+            if response.status_code not in (403, 404):
+                raise ValueError(f"Device authorization failed: {response.text}")
+
+            await asyncio.sleep(poll_interval + 3)
+
+    raise TimeoutError("Device authorization timed out")
 
 
 async def refresh_codex_token(auth: CodexAuth) -> CodexAuth:
@@ -436,8 +562,8 @@ async def refresh_codex_token(auth: CodexAuth) -> CodexAuth:
 
         token_data = response.json()
         access_token = token_data.get("access_token", "")
-        refreshed_account_id = auth.account_id or extract_account_id(access_token)
-        refreshed_email = auth.email or extract_account_email(access_token)
+        refreshed_account_id = auth.account_id or _extract_account_id_from_token_data(token_data)
+        refreshed_email = auth.email or _extract_email_from_token_data(token_data)
 
         refreshed = CodexAuth(
             access_token=access_token,
@@ -531,6 +657,47 @@ async def codex_interactive_login() -> CodexAuth:
             "addedAt": int(time.time() * 1000),
             "lastUsed": int(time.time() * 1000),
         })
+        storage.active_index = len(storage.accounts) - 1
+
+    save_codex_accounts(storage)
+
+    print(f"Authenticated (account ID: {auth.account_id})")
+    print(f"Credentials saved to {get_codex_accounts_path()}")
+    return auth
+
+
+async def codex_device_login() -> CodexAuth:
+    """Authenticate via the headless Codex device-code flow."""
+    device = await request_codex_device_code()
+    print("\nOpen this URL and enter the code:")
+    print(device["verification_uri"])
+    print(f"\nCode: {device['user_code']}\n")
+
+    auth = await exchange_codex_device_code(
+        device["device_auth_id"],
+        device["user_code"],
+        interval=int(device.get("interval") or 5),
+    )
+
+    storage = load_codex_accounts() or CodexAccountStorage()
+    now_ms = int(time.time() * 1000)
+    existing_idx = next(
+        (i for i, acc in enumerate(storage.accounts) if acc.get("account_id") == auth.account_id),
+        None,
+    )
+    payload = {
+        "account_id": auth.account_id,
+        "refresh_token": auth.refresh_token,
+        "email": auth.email,
+        "addedAt": now_ms,
+        "lastUsed": now_ms,
+    }
+    if existing_idx is not None:
+        payload["addedAt"] = storage.accounts[existing_idx].get("addedAt", now_ms)
+        storage.accounts[existing_idx] = payload
+        storage.active_index = existing_idx
+    else:
+        storage.accounts.append(payload)
         storage.active_index = len(storage.accounts) - 1
 
     save_codex_accounts(storage)
