@@ -8,6 +8,9 @@ import os
 import re
 import shutil
 from typing import Any
+from urllib.parse import urlparse
+
+import httpx
 
 import httpx
 
@@ -274,6 +277,83 @@ def _load_copilot_client():
             "Install it with `pip install github-copilot-sdk`."
         ) from exc
     return CopilotClient
+
+
+def _copilot_api_base(enterprise_url: str | None = None) -> str:
+    raw = (enterprise_url or "").strip()
+    if not raw:
+        return "https://api.githubcopilot.com"
+
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = parsed.netloc or parsed.path.split("/", 1)[0]
+    host = host.strip().rstrip("/")
+    if not host or host == "github.com":
+        return "https://api.githubcopilot.com"
+    return f"https://copilot-api.{host}"
+
+
+def _copilot_model_enabled(item: dict[str, Any]) -> bool:
+    if item.get("model_picker_enabled") is False:
+        return False
+    policy = item.get("policy")
+    if isinstance(policy, dict) and str(policy.get("state") or "").lower() == "disabled":
+        return False
+    return True
+
+
+def _format_copilot_api_model(item: dict[str, Any]) -> dict[str, str] | None:
+    model_id = str(item.get("id") or "").strip()
+    if not model_id:
+        return None
+    name = str(item.get("name") or "").strip() or model_id_to_name(model_id)
+    family = ""
+    capabilities = item.get("capabilities")
+    if isinstance(capabilities, dict):
+        family = str(capabilities.get("family") or "").strip()
+    suffix = f" ({family})" if family else ""
+    return {
+        "id": model_id,
+        "name": name,
+        "description": f"{name} via Copilot{suffix}",
+    }
+
+
+async def fetch_copilot_api_models(
+    auth: CopilotAuth | None,
+    *,
+    timeout: float = 30.0,
+) -> list[dict[str, str]]:
+    if not auth or not auth.access_token or auth.is_expired():
+        return []
+
+    api_base = _copilot_api_base(getattr(auth, "enterprise_url", None))
+    headers = {
+        "Authorization": f"Bearer {auth.access_token}",
+        "Accept": "application/json",
+        "User-Agent": "co-scientist/copilot",
+        "Editor-Version": "vscode/1.99.0",
+        "Editor-Plugin-Version": "copilot-chat/0.26.7",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(f"{api_base}/models", headers=headers)
+    if not response.is_success:
+        response.raise_for_status()
+    payload = response.json()
+    raw_models = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw_models, list):
+        return []
+
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_models:
+        if not isinstance(item, dict) or not _copilot_model_enabled(item):
+            continue
+        model = _format_copilot_api_model(item)
+        if not model or model["id"] in seen:
+            continue
+        seen.add(model["id"])
+        results.append(model)
+    return results
 
 
 async def fetch_copilot_models(
